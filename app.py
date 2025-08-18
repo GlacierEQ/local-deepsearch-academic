@@ -172,20 +172,24 @@ def web_search_node(state: ResearchState) -> ResearchState:
         domain_urls = []
         st.write(f"-> Using web search for '{domain}'")
         try:
-            from duckduckgo_search import DDGS
+            from tavily import TavilyClient
+
+            tavily = TavilyClient(api_key=os.get_environ("TAVILY_API_KEY"))
+
+            num_to_fetch = 100000
+
+            response = tavily.search(
+                query=state["query"],
+                search_depth="advanced",
+                include_answer=True,
+                max_results=num_to_fetch,
+                include_domains=[domain]
+            )
             
             # Fetch a larger pool of results to filter through
-            num_to_fetch = 100000
             
-            # Embed date range into the query string
-            date_filter = f"after:{state['start_year']}-01-01 before:{state['end_year']}-12-31"
-            query = f""""{state['query']}" site:{domain} filetype:pdf {date_filter}"""
-            
-            with DDGS() as ddgs:
-                results_iterator = ddgs.text(query, max_results=num_to_fetch)
-                domain_urls = [r for r in results_iterator]                # Filter for valid URLs and stop when we have enough
+            domain_urls = [r['url'] for r in response]                # Filter for valid URLs and stop when we have enough 
            
-            st.write(f"   Filtered down to {len(domain_urls)} valid links for {domain}.")
         except Exception as e:
             st.warning(f"Could not search {domain}: {e}")
         

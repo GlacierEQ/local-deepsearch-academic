@@ -12,7 +12,7 @@ langchain-google-genai
 ollama
 scikit-learn
 # Web Search
-duckduckgo-search
+tavily-python
 requests
 beautifulsoup4
 # Document Processing
