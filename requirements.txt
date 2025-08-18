@@ -15,9 +15,6 @@ scikit-learn
 duckduckgo-search
 requests
 beautifulsoup4
-arxiv 
-pymupdf
-
 # Document Processing
 pypdf     # For loading and extracting text from PDFs with PyPDFLoader
 fpdf2     # For generating the PDF chat history report

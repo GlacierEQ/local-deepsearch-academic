@@ -11,6 +11,7 @@ import uuid
 from fpdf import FPDF
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -22,7 +23,6 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langgraph.graph import StateGraph, START, END
-from langchain_community.utilities import ArxivAPIWrapper
 
 # --- CONFIGURATION ---
 
@@ -149,6 +149,8 @@ class ResearchState(TypedDict):
     query: str
     domains: List[str]
     num_references_per_domain: int
+    start_year: int
+    end_year: int
     landing_page_urls: Annotated[List[str], operator.add]
     direct_pdf_urls: Annotated[List[str], operator.add]
     path_to_url_map: dict
@@ -162,39 +164,35 @@ def start_search_node(state: ResearchState) -> ResearchState:
     st.write("Starting research process...")
     return {"landing_page_urls": [], "direct_pdf_urls": [], "path_to_url_map": {}, "extracted_docs": []}
 
-def _search_arxiv(query: str, max_results: int) -> List[str]:
-    try:
-        arxiv = ArxivAPIWrapper(top_k_results=max_results, doc_content_chars_max=None)
-        results = arxiv.load(query=query)
-        return [doc.metadata.get('entry_id') for doc in results]
-    except Exception as e:
-        st.warning(f"Could not search Arxiv: {e}")
-        return []
-
 def web_search_node(state: ResearchState) -> ResearchState:
     st.write("Stage 1: Finding article landing pages...")
     all_landing_urls = []
     
     for domain in state["domains"]:
-        if "arxiv.org" in domain:
-            st.write(f"-> Using specialized Arxiv search for '{state['query']}'")
-            urls = _search_arxiv(state['query'], state["num_references_per_domain"])
-            all_landing_urls.extend(urls)
-            st.write(f"   Found {len(urls)} papers on Arxiv.")
-        else:
-            st.write(f"-> Using general web search for '{domain}'")
-            try:
-                from duckduckgo_search import DDGS
-                query = f'site:{domain} {state["query"]}'
-                with DDGS() as ddgs:
-                    results = [r['href'] for r in ddgs.text(query, max_results=state["num_references_per_domain"])]
-                    st.write(f"   Found {len(results)} potential pages on {domain}.")
-                    all_landing_urls.extend(results)
-            except Exception as e:
-                st.warning(f"Could not search {domain}: {e}")
+        domain_urls = []
+        st.write(f"-> Using web search for '{domain}'")
+        try:
+            from duckduckgo_search import DDGS
+            
+            # Fetch a larger pool of results to filter through
+            num_to_fetch = 100000
+            
+            # Embed date range into the query string
+            date_filter = f"after:{state['start_year']}-01-01 before:{state['end_year']}-12-31"
+            query = f""""{state['query']}" site:{domain} filetype:pdf {date_filter}"""
+            
+            with DDGS() as ddgs:
+                results_iterator = ddgs.text(query, max_results=num_to_fetch)
+                domain_urls = [r for r in results_iterator]                # Filter for valid URLs and stop when we have enough
+           
+            st.write(f"   Filtered down to {len(domain_urls)} valid links for {domain}.")
+        except Exception as e:
+            st.warning(f"Could not search {domain}: {e}")
+        
+        all_landing_urls.extend(domain_urls)
                 
     unique_urls = list(set(all_landing_urls))
-    st.write(f"Found a total of {len(unique_urls)} unique article pages.")
+    st.write(f"Found a total of {len(unique_urls)} unique article pages across all domains.")
     return {"landing_page_urls": unique_urls}
 
 def find_pdf_links_node(state: ResearchState) -> ResearchState:
@@ -215,10 +213,9 @@ def find_pdf_links_node(state: ResearchState) -> ResearchState:
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'html.parser')
             
+            # Heuristic to find PDF links
             pdf_link = soup.find('a', href=lambda href: href and href.lower().endswith('.pdf'))
-            if not pdf_link and "arxiv.org" in url:
-                pdf_link = soup.find('a', class_='abs-button download-pdf')
-
+            
             if pdf_link and pdf_link.get('href'):
                 pdf_url = pdf_link['href']
                 if not pdf_url.startswith('http'):
@@ -282,7 +279,6 @@ def extract_text_node(state: ResearchState) -> ResearchState:
     return {"extracted_docs": all_docs}
 
 def get_llm_and_embeddings(model_name: str, embeddings_model_name: Optional[str] = None):
-    """Initializes Ollama LLM and embeddings models."""
     llm = ChatOllama(model=model_name, temperature=0.3)
     embed_model = embeddings_model_name if embeddings_model_name else model_name
     embeddings = OllamaEmbeddings(model=embed_model)
@@ -299,7 +295,6 @@ def build_raptor_index_node(state: ResearchState) -> ResearchState:
         st.error("Ollama chat model not configured correctly.")
         return {"raptor_index": None}
 
-    # Use the dedicated summary model if provided, otherwise fall back to the chat model
     summarizer_model_name = summary_model_name if summary_model_name else chat_model_name
     llm_for_summaries = ChatOllama(model=summarizer_model_name, temperature=0.3)
     
@@ -336,7 +331,7 @@ builder.add_edge("extract_text", "build_raptor_index")
 builder.add_edge("build_raptor_index", END)
 graph = builder.compile()
 
-# --- HELPER FUNCTIONS & UI (No changes needed below this line) ---
+# --- HELPER FUNCTIONS & UI ---
 def generate_pdf_report(chat_history: List[Dict[str, str]], used_sources: List[str]) -> bytes:
     pdf = FPDF()
     pdf.add_page()
@@ -376,8 +371,8 @@ def generate_bibliography_pdf(all_sources: List[str]) -> bytes:
         pdf.multi_cell(0, 8, f"{i+1}. {source}")
     return pdf.output(dest='S').encode('latin-1')
 
-def generate_mermaid_diagram(query: str, domains: List[str], num_refs: int, found_urls: int) -> str:
-    return f"""graph TD; A[Start: User Input] --> B(LangGraph Pipeline); B --> C[Web Search for Landing Pages]; C --> D[Scrape for PDF Links]; D --> E[Download & Validate PDFs]; E --> F[Extract Text]; F --> G[Build RAPTOR Index]; G --> H[Conversational QA]; subgraph Parameters; P1("Query: {query}"); P2("Domains: {', '.join(domains)}"); P3("References per Domain: {num_refs}"); end; subgraph Results; R1("Found URLs: {found_urls}"); end; C -- found pages --> D; D -- found links --> E; """
+def generate_mermaid_diagram(query: str, domains: List[str], num_refs: int, found_urls: int, start_year: int, end_year: int) -> str:
+    return f"""graph TD; A[Start: User Input] --> B(LangGraph Pipeline); B --> C[Web Search for Landing Pages]; C --> D[Scrape for PDF Links]; D --> E[Download & Validate PDFs]; E --> F[Extract Text]; F --> G[Build RAPTOR Index]; G --> H[Conversational QA]; subgraph Parameters; P1("Query: {query}"); P2("Domains: {', '.join(domains)}"); P3("References per Domain: {num_refs}"); P4("Years: {start_year}-{end_year}"); end; subgraph Results; R1("Found URLs: {found_urls}"); end; C -- found pages --> D; D -- found links --> E; """
 
 @st.cache_data(show_spinner=False)
 def get_ollama_models():
@@ -405,10 +400,16 @@ def main():
         st.header("1. Research Parameters")
         query = st.text_input("Academic Topic", "indoor quality monitoring using machine learning")
         domains_str = st.text_area("Webpage Domains (one per line)", "\n".join(DEFAULT_DOMAINS))
-        num_references = st.slider("References per Domain", 1, 300, 5)
+        num_references = st.slider("References per Domain", 1, 50, 5)
+        
+        current_year = datetime.now().year
+        start_year = st.number_input("Start Year", min_value=1980, max_value=current_year, value=2020)
+        end_year = st.number_input("End Year", min_value=1980, max_value=current_year, value=current_year)
+        
+        if start_year > end_year:
+            st.error("Error: Start year cannot be after end year.")
 
         st.header("2. AI Model Configuration")
-        st.info("For Arxiv.org, a specialized API is used for better results.")
         
         ollama_models = get_ollama_models()
         if ollama_models:
@@ -434,7 +435,7 @@ def main():
             }
         
         st.header("3. Start Research")
-        if st.button("Start Research Pipeline"):
+        if st.button("Start Research Pipeline") and start_year <= end_year:
             if not st.session_state.model_config.get("model_name"):
                 st.error("Please configure the AI model before starting.")
             else:
@@ -446,7 +447,13 @@ def main():
                     os.remove(checkpoint_file)
                 with st.spinner("Running deep research pipeline..."):
                     domains = [d.strip() for d in domains_str.split("\n") if d.strip()]
-                    initial_state = {"query": query, "domains": domains, "num_references_per_domain": num_references}
+                    initial_state = {
+                        "query": query, 
+                        "domains": domains, 
+                        "num_references_per_domain": num_references,
+                        "start_year": start_year,
+                        "end_year": end_year
+                    }
                     final_state = graph.invoke(initial_state)
                     if final_state.get("raptor_index"):
                         st.session_state.research_done = True
@@ -514,8 +521,13 @@ def main():
             if st.button("Generate Pipeline Diagram"):
                 final_state = st.session_state.final_state
                 mermaid_code = generate_mermaid_diagram(
-                    query=final_state['query'], domains=final_state['domains'],
-                    num_refs=final_state['num_references_per_domain'], found_urls=len(final_state['direct_pdf_urls']))
+                    query=final_state['query'], 
+                    domains=final_state['domains'],
+                    num_refs=final_state['num_references_per_domain'], 
+                    found_urls=len(final_state['direct_pdf_urls']),
+                    start_year=final_state['start_year'],
+                    end_year=final_state['end_year']
+                )
                 st.code(mermaid_code, language="mermaid")
     else:
         st.info("Configure your research and AI model in the sidebar, then click 'Start Research Pipeline'.")
