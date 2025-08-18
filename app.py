@@ -3,6 +3,7 @@
 import streamlit as st
 import os
 import numpy as np
+import json
 from sklearn.cluster import KMeans
 from typing import List, Optional, Dict, Any, TypedDict, Annotated, Tuple
 import operator
@@ -26,7 +27,7 @@ from langgraph.graph import StateGraph, START, END
 
 # Default academic domains to search
 DEFAULT_DOMAINS = ["ieeexplore.ieee.org", "dl.acm.org", "arxiv.org", "scholar.google.com"]
-GEMINI_MODELS = ["gemini-2.5-pro-latest", "gemini-2.5-flash-latest"]
+GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"]
 
 # --- RAPTOR IMPLEMENTATION ---
 
@@ -40,43 +41,81 @@ class RAPTORRetriever(BaseRetriever):
 class RAPTOR:
     """
     RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval
-    This class implements the RAPTOR indexing and retrieval mechanism.
+    This class implements the RAPTOR indexing and retrieval mechanism with checkpointing.
     """
-    def __init__(self, llm, embeddings_model, chunk_size=1000, chunk_overlap=200):
+    def __init__(self, llm, embeddings_model, session_id, chunk_size=1000, chunk_overlap=200):
         self.llm = llm
         self.embeddings_model = embeddings_model
+        self.session_id = session_id
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         self.tree = {}
         self.all_nodes = {}
         self.vector_store = None
         self.node_ids = []
+        self.checkpoint_path = f"checkpoint_{self.session_id}.json"
+
+    def _save_checkpoint(self, level):
+        """Saves the current state of the tree to a file."""
+        state = {
+            "level": level,
+            "tree": {str(k): v for k, v in self.tree.items()}, # Ensure keys are strings
+            "all_nodes": self.all_nodes,
+        }
+        with open(self.checkpoint_path, 'w') as f:
+            json.dump(state, f)
+        st.write(f"Checkpoint saved for level {level}.")
+
+    def _load_checkpoint(self) -> int:
+        """Loads the state from a checkpoint file if it exists."""
+        if os.path.exists(self.checkpoint_path):
+            try:
+                with open(self.checkpoint_path, 'r') as f:
+                    state = json.load(f)
+                self.tree = state["tree"]
+                self.all_nodes = state["all_nodes"]
+                start_level = state["level"]
+                st.info(f"Resuming from checkpoint at level {start_level}.")
+                return start_level
+            except (json.JSONDecodeError, KeyError) as e:
+                st.warning(f"Could not load checkpoint file due to error: {e}. Starting from scratch.")
+                return 0
+        return 0
 
     def add_documents(self, text: str):
-        st.write("Step 1: Splitting text into initial chunks (Level 0)...")
-        initial_chunks = self.text_splitter.create_documents([text])
-        level_0_texts = [doc.page_content for doc in initial_chunks]
+        start_level = self._load_checkpoint()
         
-        for i, chunk_text in enumerate(level_0_texts):
-            self.all_nodes[f"0_{i}"] = chunk_text
+        if start_level == 0:
+            st.write("Step 1: Splitting text into initial chunks (Level 0)...")
+            initial_chunks = self.text_splitter.create_documents([text])
+            level_0_texts = [doc.page_content for doc in initial_chunks]
+            
+            for i, chunk_text in enumerate(level_0_texts):
+                self.all_nodes[f"0_{i}"] = chunk_text
+            
+            self.tree[str(0)] = level_0_texts
+            self._save_checkpoint(0) # Save initial state
         
-        self.tree[0] = level_0_texts
-        current_level = 0
+        current_level = start_level
         
-        while len(self.tree[current_level]) > 1:
+        while len(self.tree[str(current_level)]) > 1:
             next_level = current_level + 1
             st.write(f"Step 2: Building Level {next_level} of the tree...")
             
-            current_level_nodes = self.tree[current_level]
+            current_level_nodes = self.tree[str(current_level)]
             clustered_indices = self._cluster_nodes(current_level_nodes)
             
             next_level_nodes = []
-            with st.spinner(f"Summarizing {len(clustered_indices)} clusters for Level {next_level}..."):
-                for i, indices in enumerate(clustered_indices):
-                    summary = self._summarize_cluster([current_level_nodes[j] for j in indices])
-                    next_level_nodes.append(summary)
-                    self.all_nodes[f"{next_level}_{i}"] = summary
+            num_clusters = len(clustered_indices)
+            summary_progress = st.progress(0, text=f"Summarizing Level {next_level}...")
             
-            self.tree[next_level] = next_level_nodes
+            for i, indices in enumerate(clustered_indices):
+                summary = self._summarize_cluster([current_level_nodes[j] for j in indices])
+                next_level_nodes.append(summary)
+                self.all_nodes[f"{next_level}_{i}"] = summary
+                summary_progress.progress((i + 1) / num_clusters, text=f"Summarizing cluster {i+1}/{num_clusters} for Level {next_level}...")
+            
+            self.tree[str(next_level)] = next_level_nodes
+            self._save_checkpoint(next_level)
             current_level = next_level
 
         st.write("Step 3: Creating final vector store from all nodes...")
@@ -85,6 +124,9 @@ class RAPTOR:
         
         self.vector_store = FAISS.from_texts(texts=node_texts, embedding=self.embeddings_model)
         st.write("RAPTOR index built successfully!")
+
+        if os.path.exists(self.checkpoint_path):
+            os.remove(self.checkpoint_path)
 
     def _cluster_nodes(self, node_texts: List[str]) -> List[List[int]]:
         st.write(f"Embedding {len(node_texts)} nodes for clustering...")
@@ -104,7 +146,7 @@ class RAPTOR:
     def _summarize_cluster(self, cluster_texts: List[str]) -> str:
         context = "\n\n---\n\n".join(cluster_texts)
         prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="You are a helpful AI assistant tasked with summarizing academic texts. Create a concise, abstractive summary of the following content. The summary should synthesize the key information and concepts from the provided text snippets."),
+            SystemMessage(content="You are an AI assistant that summarizes academic texts. Create a concise, abstractive summary of the following content, synthesizing the key information."),
             HumanMessage(content=f"Please summarize the following content:\n\n{context}")
         ])
         
@@ -117,9 +159,7 @@ class RAPTOR:
     def as_retriever(self) -> BaseRetriever:
         return RAPTORRetriever(raptor_index=self)
 
-
 # --- STATE DEFINITION FOR LANGGRAPH ---
-
 class ResearchState(TypedDict):
     query: str
     domains: List[str]
@@ -131,8 +171,7 @@ class ResearchState(TypedDict):
     conversation_history: Annotated[List[BaseMessage], operator.add]
     generation: str
 
-# --- LANGGRAPH NODES AND GRAPH DEFINITION (No changes here) ---
-
+# --- LANGGRAPH NODES AND GRAPH DEFINITION ---
 def start_search_node(state: ResearchState) -> ResearchState:
     st.write("Starting research process...")
     return {"paper_urls": [], "downloaded_pdf_paths": [], "extracted_text": ""}
@@ -159,7 +198,16 @@ def download_pdfs_node(state: ResearchState) -> ResearchState:
     pdf_paths = []
     if not os.path.exists("temp_pdfs"):
         os.makedirs("temp_pdfs")
-    for url in state["paper_urls"]:
+    
+    total_urls = len(state["paper_urls"])
+    if total_urls == 0:
+        st.warning("No paper URLs found to download.")
+        return {"downloaded_pdf_paths": []}
+        
+    download_progress = st.progress(0, text="Starting download...")
+
+    for i, url in enumerate(state["paper_urls"]):
+        download_progress.progress((i + 1) / total_urls, text=f"Downloading paper {i+1}/{total_urls}...")
         try:
             response = requests.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
             response.raise_for_status()
@@ -167,9 +215,9 @@ def download_pdfs_node(state: ResearchState) -> ResearchState:
             with open(filename, "wb") as f:
                 f.write(response.content)
             pdf_paths.append(filename)
-            st.write(f"Successfully downloaded {url}")
         except Exception as e:
             st.warning(f"Failed to download {url}: {e}")
+            
     return {"downloaded_pdf_paths": pdf_paths}
 
 def extract_text_node(state: ResearchState) -> ResearchState:
@@ -185,13 +233,14 @@ def extract_text_node(state: ResearchState) -> ResearchState:
     st.write(f"Extracted a total of {len(full_text)} characters.")
     return {"extracted_text": full_text}
 
-def get_llm_and_embeddings(provider: str, model_name: str):
+def get_llm_and_embeddings(provider: str, model_name: str, embeddings_model_name: Optional[str] = None):
     if provider == "gemini":
         llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.3, convert_system_message_to_human=True)
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     else: # Ollama
         llm = ChatOllama(model=model_name, temperature=0.3)
-        embeddings = OllamaEmbeddings(model=model_name)
+        embed_model = embeddings_model_name if embeddings_model_name else model_name
+        embeddings = OllamaEmbeddings(model=embed_model)
     return llm, embeddings
 
 def build_raptor_index_node(state: ResearchState) -> ResearchState:
@@ -199,18 +248,23 @@ def build_raptor_index_node(state: ResearchState) -> ResearchState:
     model_config = st.session_state.get("model_config", {})
     provider = model_config.get("provider")
     model_name = model_config.get("model_name")
+    embeddings_model_name = model_config.get("embeddings_model_name")
     
     if not provider or not model_name:
         st.error("LLM provider or model not configured correctly.")
         return {"raptor_index": None}
 
-    llm, embeddings = get_llm_and_embeddings(provider, model_name)
+    llm, embeddings = get_llm_and_embeddings(provider, model_name, embeddings_model_name=embeddings_model_name)
     
     if not state["extracted_text"]:
         st.error("No text was extracted from PDFs. Cannot build index.")
         return {"raptor_index": None}
 
-    raptor_index = RAPTOR(llm=llm, embeddings_model=embeddings)
+    raptor_index = RAPTOR(
+        llm=llm, 
+        embeddings_model=embeddings, 
+        session_id=st.session_state.session_id
+    )
     raptor_index.add_documents(state["extracted_text"])
     
     st.success("Research and indexing complete! You can now ask questions.")
@@ -222,7 +276,6 @@ builder.add_node("web_search", web_search_node)
 builder.add_node("download_pdfs", download_pdfs_node)
 builder.add_node("extract_text", extract_text_node)
 builder.add_node("build_raptor_index", build_raptor_index_node)
-
 builder.add_edge(START, "start_search")
 builder.add_edge("start_search", "web_search")
 builder.add_edge("web_search", "download_pdfs")
@@ -232,7 +285,6 @@ builder.add_edge("build_raptor_index", END)
 graph = builder.compile()
 
 # --- HELPER FUNCTIONS FOR EXPORT ---
-
 def generate_pdf_report(chat_history: List[Dict[str, str]]) -> bytes:
     pdf = FPDF()
     pdf.add_page()
@@ -242,10 +294,10 @@ def generate_pdf_report(chat_history: List[Dict[str, str]]) -> bytes:
         role = message.get('role', '')
         content = message.get('content', '')
         if role == 'user':
-            pdf.set_text_color(0, 0, 255) # Blue
+            pdf.set_text_color(0, 0, 255)
             pdf.multi_cell(0, 10, f"Question: {content}")
         else:
-            pdf.set_text_color(0, 0, 0) # Black
+            pdf.set_text_color(0, 0, 0)
             pdf.multi_cell(0, 10, f"Answer: {content}")
         pdf.ln(5)
     return pdf.output(dest='S').encode('latin-1')
@@ -254,15 +306,12 @@ def generate_mermaid_diagram(query: str, domains: List[str], num_refs: int, foun
     return f"""graph TD; A[Start: User Input] --> B(LangGraph Pipeline); B --> C[Web Search]; C --> D[Download PDFs]; D --> E[Extract Text]; E --> F[Build RAPTOR Index]; F --> G[Conversational QA]; subgraph Parameters; P1("Query: {query}"); P2("Domains: {', '.join(domains)}"); P3("References per Domain: {num_refs}"); end; subgraph Results; R1("Found URLs: {found_urls}"); end; A -- Parameters --> P1 & P2 & P3; C -- Results --> R1;"""
 
 # --- STREAMLIT UI ---
-
 @st.cache_data(show_spinner=False)
 def get_ollama_models():
-    """Fetches the list of models from the Ollama API."""
     try:
         response = requests.get("http://localhost:11434/api/tags")
         response.raise_for_status()
-        models = [model['name'] for model in response.json().get('models', [])]
-        return models
+        return [model['name'] for model in response.json().get('models', [])]
     except (requests.exceptions.RequestException, KeyError):
         return []
 
@@ -281,19 +330,28 @@ def main():
         st.header("1. Research Parameters")
         query = st.text_input("Academic Topic", "indoor quality monitoring using machine learning")
         domains_str = st.text_area("Webpage Domains (one per line)", "\n".join(DEFAULT_DOMAINS))
-        num_references = st.slider("References per Domain", 1, 500, 2)
+        num_references = st.slider("References per Domain", 1, 50, 5)
 
         st.header("2. AI Model Configuration")
         llm_provider = st.selectbox("LLM Provider", ["Ollama", "Gemini"], key="llm_provider")
 
         model_name = None
+        embeddings_model_name = None
+
         if llm_provider == "Ollama":
             ollama_models = get_ollama_models()
             if ollama_models:
-                model_name = st.selectbox("Select an Ollama Model", ollama_models)
+                # Suggest a common chat model as default if available.
+                default_chat_index = ollama_models.index("llama3:8b") if "llama3:8b" in ollama_models else 0
+                model_name = st.selectbox("Select a Chat Model", ollama_models, index=default_chat_index)
+                
+                # Suggest a common embeddings model as default if available.
+                default_embed_index = ollama_models.index("mxbai-embed-large") if "mxbai-embed-large" in ollama_models else 0
+                embeddings_model_name = st.selectbox("Select an Embeddings Model", ollama_models, index=default_embed_index)
             else:
-                st.warning("Ollama not detected. Please enter model name manually.")
-                model_name = st.text_input("Ollama Model Name", "llama3")
+                st.warning("Ollama not detected. Please enter model names manually.")
+                model_name = st.text_input("Ollama Chat Model Name", "llama3")
+                embeddings_model_name = st.text_input("Ollama Embeddings Model Name", "mxbai-embed-large")
         
         elif llm_provider == "Gemini":
             google_api_key = os.environ.get("GOOGLE_API_KEY")
@@ -305,9 +363,12 @@ def main():
             else:
                 st.warning("Google API Key is required to use Gemini.")
         
-        # Store config for use in the graph
         if model_name:
-            st.session_state.model_config = {"provider": llm_provider.lower(), "model_name": model_name}
+            st.session_state.model_config = {
+                "provider": llm_provider.lower(),
+                "model_name": model_name,
+                "embeddings_model_name": embeddings_model_name
+            }
         
         st.header("3. Start Research")
         if st.button("Start Research Pipeline"):
@@ -316,7 +377,14 @@ def main():
             else:
                 st.session_state.research_done = False
                 st.session_state.messages = []
-                with st.spinner("Running deep research pipeline... This can take several minutes."):
+                
+                # Clear any old checkpoints from previous runs, but not for the current session
+                # This button click signifies a new research task
+                checkpoint_file = f"checkpoint_{st.session_state.session_id}.json"
+                if os.path.exists(checkpoint_file):
+                    os.remove(checkpoint_file)
+
+                with st.spinner("Running deep research pipeline..."):
                     domains = [d.strip() for d in domains_str.split("\n") if d.strip()]
                     initial_state = {"query": query, "domains": domains, "num_references_per_domain": num_references}
                     final_state = graph.invoke(initial_state)
@@ -341,10 +409,14 @@ def main():
                 with st.spinner("Thinking..."):
                     retriever = st.session_state.final_state['raptor_index'].as_retriever()
                     model_config = st.session_state.model_config
-                    llm, _ = get_llm_and_embeddings(model_config["provider"], model_config["model_name"])
+                    llm, _ = get_llm_and_embeddings(
+                        provider=model_config["provider"],
+                        model_name=model_config["model_name"],
+                        embeddings_model_name=model_config.get("embeddings_model_name")
+                    )
                     
                     prompt_template = ChatPromptTemplate.from_messages([
-                        ("system", "You are an AI research assistant. Answer the user's question based on the following context retrieved from academic papers:\n\n{context}\n\nIf the context doesn't contain the answer, state that clearly."),
+                        ("system", "You are an AI research assistant. Answer based on the following context from academic papers:\n\n{context}\n\nIf the answer isn't in the context, say so."),
                         ("human", "{question}")
                     ])
                     
