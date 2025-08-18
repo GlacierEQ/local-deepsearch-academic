@@ -12,13 +12,13 @@ langchain-google-genai
 ollama
 scikit-learn
 # Web Search
-tavily-python
 requests
-beautifulsoup4
+arxiv
+
 # Document Processing
 pypdf     # For loading and extracting text from PDFs with PyPDFLoader
 fpdf2     # For generating the PDF chat history report
-
+python-dotenv
 # Data Validation
 pydantic
 # Environment Variable Management

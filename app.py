@@ -12,8 +12,10 @@ from fpdf import FPDF
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
+import arxiv
+
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -23,12 +25,16 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langgraph.graph import StateGraph, START, END
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- CONFIGURATION ---
 
-DEFAULT_DOMAINS = ["arxiv.org", "ieeexplore.ieee.org", "dl.acm.org"]
+# Corrected Scopus to Elsevier, as it's the publisher.
+DEFAULT_PUBLISHERS = ["IEEE", "ACM", "Springer", "Elsevier"]
 
-# --- RAPTOR IMPLEMENTATION (No changes here) ---
+# --- RAPTOR IMPLEMENTATION ---
 
 class RAPTORRetriever(BaseRetriever):
     raptor_index: Any
@@ -126,34 +132,43 @@ class RAPTOR:
             clusters[label].append(i)
         return clusters
 
+    # --- START OF FIX 1 ---
     def _summarize_cluster(self, cluster_docs: List[Document]) -> Tuple[str, dict]:
         context = "\n\n---\n\n".join([doc.page_content for doc in cluster_docs])
+        
+        # Create a proper prompt template with a placeholder
         prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content="You are an AI assistant that summarizes academic texts. Create a concise, abstractive summary of the following content, synthesizing the key information."),
-            HumanMessage(content=f"Please summarize the following content:\n\n{context}")
+            HumanMessage(content="Please summarize the following content:\n\n{context}")
         ])
-        response = self.llm.invoke(prompt)
+        
+        # Create a chain by piping the prompt and the model
+        chain = prompt | self.llm
+        
+        # Invoke the chain with the context variable
+        response = chain.invoke({"context": context})
+        
         summary = response.content
         aggregated_sources = list(set(doc.metadata.get("url", "Unknown Source") for doc in cluster_docs))
         combined_metadata = {"sources": aggregated_sources}
         return summary, combined_metadata
-
+    # --- END OF FIX 1 ---
+    
     def retrieve(self, query: str, k: int = 5) -> List[Document]:
         return self.vector_store.similarity_search(query, k=k) if self.vector_store else []
     
     def as_retriever(self) -> BaseRetriever:
         return RAPTORRetriever(raptor_index=self)
 
-# --- STATE DEFINITION FOR LANGGRAPH ---
+# --- STATE DEFINITION FOR LANGGRAPH (No changes here) ---
 class ResearchState(TypedDict):
     query: str
-    domains: List[str]
-    num_references_per_domain: int
+    publishers: List[str]
+    num_references: int
     start_year: int
     end_year: int
-    landing_page_urls: Annotated[List[str], operator.add]
-    direct_pdf_urls: Annotated[List[str], operator.add]
-    path_to_url_map: dict
+    papers_by_publisher: Dict[str, List[str]]
+    path_to_metadata_map: Dict[str, Dict[str, str]]
     extracted_docs: list
     raptor_index: Any
     conversation_history: Annotated[List[BaseMessage], operator.add]
@@ -162,91 +177,98 @@ class ResearchState(TypedDict):
 # --- LANGGRAPH NODES AND GRAPH DEFINITION ---
 def start_search_node(state: ResearchState) -> ResearchState:
     st.write("Starting research process...")
-    return {"landing_page_urls": [], "direct_pdf_urls": [], "path_to_url_map": {}, "extracted_docs": []}
+    return {"papers_by_publisher": {}, "path_to_metadata_map": {}, "extracted_docs": []}
 
-def web_search_node(state: ResearchState) -> ResearchState:
-    st.write("Stage 1: Finding article landing pages...")
-    all_landing_urls = []
+def arxiv_search_and_filter_node(state: ResearchState) -> ResearchState:
+    st.write("Stage 1: Searching arXiv and filtering by publisher...")
     
-    for domain in state["domains"]:
-        domain_urls = []
-        st.write(f"-> Using web search for '{domain}'")
-        try:
-            from tavily import TavilyClient
+    # --- START OF FIX 2 ---
+    # Corrected filter logic for Elsevier (owner of Scopus)
+    filter_criteria = {
+        "IEEE": lambda r: (r.journal_ref and "IEEE" in r.journal_ref) or (r.doi and "10.1109" in r.doi),
+        "IEEE Explorer": lambda r: (r.journal_ref and "IEEE Explorer" in r.journal_ref)   ,      
+        "IEEE Transactions": lambda r: (r.journal_ref and "IEEE Transactions" in r.journal_ref)   ,      
+        "ACM": lambda r: (r.journal_ref and "ACM" in r.journal_ref) or (r.doi and "10.1145" in r.doi),
+        "Springer": lambda r: (r.journal_ref and "Springer" in r.journal_ref) or (r.doi and "10.1007" in r.doi),
+        "Elsevier": lambda r: (r.journal_ref and "Elsevier" in r.journal_ref) or (r.doi and "10.1016" in r.doi)
+    }
+    # --- END OF FIX 2 ---
+    
+    selected_publishers = state["publishers"]
+    if not selected_publishers:
+        st.warning("No publishers selected. Please select at least one.")
+        return {"papers_by_publisher": {}}
+    
+    query_terms = state["query"]
+    start_dt = datetime(state['start_year'], 1, 1)
+    end_dt = datetime(state['end_year'], 12, 31)
+    
+    st.write(f"Searching for: '{query_terms}'...")
+    search = arxiv.Search(
+        query=query_terms,
+        max_results=state["num_references"] * 15,
+        sort_by=arxiv.SortCriterion.SubmittedDate
+    )
+    
+    found_papers = {pub: [] for pub in selected_publishers}
+    total_found = 0
+    total_needed = state["num_references"]
+    
+    results_iterator = search.results()
+    search_progress = st.progress(0, text="Filtering arXiv results...")
+    
+    st.write("Iterating through results to find matches...")
+    
+    try:
+        for i, result in enumerate(results_iterator):
+            if total_found >= total_needed:
+                st.write(f"Reached the desired number of {total_needed} references.")
+                break
 
-            tavily = TavilyClient(api_key=os.get_environ("TAVILY_API_KEY"))
+            if i % 20 == 0:
+                progress_val = total_found / total_needed if total_needed > 0 else 0
+                search_progress.progress(progress_val, text=f"Scanned {i+1} papers | Found {total_found}/{total_needed} matches")
 
-            num_to_fetch = 100000
-
-            response = tavily.search(
-                query=state["query"],
-                search_depth="advanced",
-                include_answer=True,
-                max_results=num_to_fetch,
-                include_domains=[domain]
-            )
-            
-            # Fetch a larger pool of results to filter through
-            
-            domain_urls = [r['url'] for r in response]                # Filter for valid URLs and stop when we have enough 
-           
-        except Exception as e:
-            st.warning(f"Could not search {domain}: {e}")
-        
-        all_landing_urls.extend(domain_urls)
+            if not (start_dt.date() <= result.published.date() <= end_dt.date()):
+                continue
                 
-    unique_urls = list(set(all_landing_urls))
-    st.write(f"Found a total of {len(unique_urls)} unique article pages across all domains.")
-    return {"landing_page_urls": unique_urls}
+            for pub in selected_publishers:
+                if filter_criteria.get(pub)(result):
+                    if result.pdf_url and result.pdf_url not in [url for urllist in found_papers.values() for url in urllist]:
+                        found_papers[pub].append(result.pdf_url)
+                        total_found += 1
+                        break
+    except arxiv.UnexpectedEmptyPageError:
+        st.info("Processed all available results from arXiv for this query.")
 
-def find_pdf_links_node(state: ResearchState) -> ResearchState:
-    st.write("Stage 2: Scraping landing pages for direct PDF links...")
-    direct_urls = []
+    search_progress.progress(1.0, text="Filtering complete.")
     
-    total_urls = len(state["landing_page_urls"])
-    if total_urls == 0:
-        st.warning("No landing pages found to scrape.")
-        return {"direct_pdf_urls": []}
+    st.write("--- Search Results by Publisher ---")
+    for pub, papers in found_papers.items():
+        st.write(f"- {pub}: Found {len(papers)} papers.")
         
-    scrape_progress = st.progress(0, text="Starting scraping...")
-    
-    for i, url in enumerate(state["landing_page_urls"]):
-        scrape_progress.progress((i + 1) / total_urls, text=f"Scraping page {i+1}/{total_urls}...")
-        try:
-            response = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Heuristic to find PDF links
-            pdf_link = soup.find('a', href=lambda href: href and href.lower().endswith('.pdf'))
-            
-            if pdf_link and pdf_link.get('href'):
-                pdf_url = pdf_link['href']
-                if not pdf_url.startswith('http'):
-                    from urllib.parse import urljoin
-                    pdf_url = urljoin(url, pdf_url)
-                direct_urls.append(pdf_url)
-        except Exception as e:
-            st.warning(f"Could not scrape {url} for PDF link: {e}")
-
-    unique_urls = list(set(direct_urls))
-    st.write(f"Found {len(unique_urls)} direct PDF links.")
-    return {"direct_pdf_urls": unique_urls}
+    if total_found == 0:
+        st.warning("Could not find any papers on arXiv matching your criteria. Try broadening your search.")
+        
+    return {"papers_by_publisher": found_papers}
 
 def download_pdfs_node(state: ResearchState) -> ResearchState:
-    st.write("Stage 3: Downloading valid PDFs...")
-    path_to_url_map = {}
+    st.write("Stage 2: Downloading valid PDFs...")
+    path_to_metadata_map = {}
     if not os.path.exists("temp_pdfs"):
         os.makedirs("temp_pdfs")
     
-    total_urls = len(state["direct_pdf_urls"])
+    papers_by_publisher = state["papers_by_publisher"]
+    all_urls = [(url, pub) for pub, urls in papers_by_publisher.items() for url in urls]
+    
+    total_urls = len(all_urls)
     if total_urls == 0:
-        st.warning("No direct PDF URLs found to download.")
-        return {"path_to_url_map": {}}
+        st.warning("No PDF URLs found to download.")
+        return {"path_to_metadata_map": {}}
         
     download_progress = st.progress(0, text="Starting download...")
 
-    for i, url in enumerate(state["direct_pdf_urls"]):
+    for i, (url, publisher) in enumerate(all_urls):
         download_progress.progress((i + 1) / total_urls, text=f"Downloading paper {i+1}/{total_urls}...")
         try:
             response = requests.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'}, stream=True)
@@ -257,27 +279,28 @@ def download_pdfs_node(state: ResearchState) -> ResearchState:
                 with open(filename, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                path_to_url_map[filename] = url
+                path_to_metadata_map[filename] = {"url": url, "publisher": publisher}
             else:
                 st.warning(f"Skipped non-PDF file at {url} (Content-Type: {content_type})")
         except requests.exceptions.RequestException as e:
             st.warning(f"Failed to download {url}: {e}")
             
-    return {"path_to_url_map": path_to_url_map}
+    return {"path_to_metadata_map": path_to_metadata_map}
 
 def extract_text_node(state: ResearchState) -> ResearchState:
-    st.write("Stage 4: Extracting text from PDFs...")
+    st.write("Stage 3: Extracting text from PDFs...")
     all_docs = []
-    path_to_url_map = state["path_to_url_map"]
-    for path, url in path_to_url_map.items():
+    path_to_metadata_map = state["path_to_metadata_map"]
+    for path, metadata in path_to_metadata_map.items():
         try:
             loader = PyPDFLoader(path)
             pages = loader.load_and_split()
             for page in pages:
-                page.metadata["url"] = url
+                page.metadata["url"] = metadata["url"]
+                page.metadata["publisher"] = metadata["publisher"]
             all_docs.extend(pages)
         except Exception as e:
-            st.warning(f"Could not read or parse PDF from {url}. It may be corrupted. Error: {e}")
+            st.warning(f"Could not read or parse PDF from {metadata['url']}. It may be corrupted. Error: {e}")
             
     st.write(f"Successfully extracted {len(all_docs)} document chunks.")
     return {"extracted_docs": all_docs}
@@ -289,7 +312,7 @@ def get_llm_and_embeddings(model_name: str, embeddings_model_name: Optional[str]
     return llm, embeddings
 
 def build_raptor_index_node(state: ResearchState) -> ResearchState:
-    st.write("Stage 5: Building RAPTOR index... This may take some time.")
+    st.write("Stage 4: Building RAPTOR index... This may take some time.")
     model_config = st.session_state.get("model_config", {})
     chat_model_name = model_config.get("model_name")
     summary_model_name = model_config.get("summary_model_name")
@@ -319,23 +342,23 @@ def build_raptor_index_node(state: ResearchState) -> ResearchState:
     st.success("Research and indexing complete! You can now ask questions.")
     return {"raptor_index": raptor_index}
 
+# --- GRAPH DEFINITION (No changes here) ---
 builder = StateGraph(ResearchState)
 builder.add_node("start_search", start_search_node)
-builder.add_node("web_search", web_search_node)
-builder.add_node("find_pdf_links", find_pdf_links_node)
+builder.add_node("arxiv_search_and_filter", arxiv_search_and_filter_node)
 builder.add_node("download_pdfs", download_pdfs_node)
 builder.add_node("extract_text", extract_text_node)
 builder.add_node("build_raptor_index", build_raptor_index_node)
+
 builder.add_edge(START, "start_search")
-builder.add_edge("start_search", "web_search")
-builder.add_edge("web_search", "find_pdf_links")
-builder.add_edge("find_pdf_links", "download_pdfs")
+builder.add_edge("start_search", "arxiv_search_and_filter")
+builder.add_edge("arxiv_search_and_filter", "download_pdfs")
 builder.add_edge("download_pdfs", "extract_text")
 builder.add_edge("extract_text", "build_raptor_index")
 builder.add_edge("build_raptor_index", END)
 graph = builder.compile()
 
-# --- HELPER FUNCTIONS & UI ---
+# --- HELPER FUNCTIONS & UI (No changes here) ---
 def generate_pdf_report(chat_history: List[Dict[str, str]], used_sources: List[str]) -> bytes:
     pdf = FPDF()
     pdf.add_page()
@@ -364,19 +387,55 @@ def generate_pdf_report(chat_history: List[Dict[str, str]], used_sources: List[s
             pdf.multi_cell(0, 8, f"{i+1}. {source}")
     return pdf.output(dest='S').encode('latin-1')
 
-def generate_bibliography_pdf(all_sources: List[str]) -> bytes:
+def generate_bibliography_pdf(papers_by_publisher: Dict[str, List[str]]) -> bytes:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', size=16)
     pdf.cell(0, 10, txt="Full Bibliography of Scraped Articles", ln=True, align='C')
     pdf.ln(10)
-    pdf.set_font("Arial", size=10)
-    for i, source in enumerate(all_sources):
-        pdf.multi_cell(0, 8, f"{i+1}. {source}")
+    
+    for publisher, urls in papers_by_publisher.items():
+        if urls:
+            pdf.set_font("Arial", 'B', size=14)
+            pdf.cell(0, 10, txt=f"--- {publisher} ---", ln=True, align='L')
+            pdf.ln(5)
+            pdf.set_font("Arial", size=10)
+            for i, url in enumerate(urls):
+                pdf.multi_cell(0, 8, f"{i+1}. {url}")
+            pdf.ln(5)
+            
     return pdf.output(dest='S').encode('latin-1')
 
-def generate_mermaid_diagram(query: str, domains: List[str], num_refs: int, found_urls: int, start_year: int, end_year: int) -> str:
-    return f"""graph TD; A[Start: User Input] --> B(LangGraph Pipeline); B --> C[Web Search for Landing Pages]; C --> D[Scrape for PDF Links]; D --> E[Download & Validate PDFs]; E --> F[Extract Text]; F --> G[Build RAPTOR Index]; G --> H[Conversational QA]; subgraph Parameters; P1("Query: {query}"); P2("Domains: {', '.join(domains)}"); P3("References per Domain: {num_refs}"); P4("Years: {start_year}-{end_year}"); end; subgraph Results; R1("Found URLs: {found_urls}"); end; C -- found pages --> D; D -- found links --> E; """
+def generate_mermaid_diagram(query: str, publishers: List[str], num_refs: int, papers_by_publisher: Dict[str, List[str]], start_year: int, end_year: int) -> str:
+    diagram = f"""graph TD;
+    A[Start: User Input] --> B(LangGraph Pipeline);
+    B --> C[Search arXiv & Filter];
+    """
+    
+    result_nodes = []
+    for pub in publishers:
+        count = len(papers_by_publisher.get(pub, []))
+        if count > 0:
+            node_id = f"R_{pub.replace(' ', '')}"
+            result_nodes.append(node_id)
+            diagram += f'    C --> {node_id}["Found {count} {pub} Papers"];\n'
+    
+    if result_nodes:
+         diagram += f"    {{{', '.join(result_nodes)}}} --> D[Download & Validate PDFs];\n"
+    else:
+        diagram += "    C --> D[Download & Validate PDFs];\n"
+
+    diagram += f"""    D --> E[Extract Text];
+    E --> F[Build RAPTOR Index];
+    F --> G[Conversational QA];
+    subgraph Parameters;
+        P1("Query: {query}");
+        P2("Publishers: {', '.join(publishers)}");
+        P3("Target References: {num_refs}");
+        P4("Years: {start_year}-{end_year}");
+    end;
+    """
+    return diagram
 
 @st.cache_data(show_spinner=False)
 def get_ollama_models():
@@ -390,7 +449,7 @@ def get_ollama_models():
 def main():
     st.set_page_config(layout="wide", page_title="Academic Deep Search")
     st.title("📚 Academic Deep Search & QA with RAPTOR")
-    st.markdown("Powered by Ollama 🦙")
+    st.markdown("Powered by Ollama 🦙 and arXiv 📄")
 
     if "session_id" not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
@@ -402,13 +461,21 @@ def main():
 
     with st.sidebar:
         st.header("1. Research Parameters")
-        query = st.text_input("Academic Topic", "indoor quality monitoring using machine learning")
-        domains_str = st.text_area("Webpage Domains (one per line)", "\n".join(DEFAULT_DOMAINS))
-        num_references = st.slider("References per Domain", 1, 50, 5)
+        query = st.text_input("Academic Topic", "indoor air quality monitoring using machine learning")
+        
+        # Updated publisher list in the UI
+        publishers = st.multiselect(
+            "Filter by Publisher (via arXiv metadata)",
+            options=["IEEE", "ACM", "Springer", "Elsevier"],
+            default=DEFAULT_PUBLISHERS
+        )
+        st.info("This filters arXiv papers that have a journal reference or DOI matching the selected publishers. 'Elsevier' is used as a proxy for papers indexed in Scopus.")
+
+        num_references = st.slider("Total Desired References", 1, 100, 10)
         
         current_year = datetime.now().year
-        start_year = st.number_input("Start Year", min_value=1980, max_value=current_year, value=2020)
-        end_year = st.number_input("End Year", min_value=1980, max_value=current_year, value=current_year)
+        start_year = st.number_input("Start Year", min_value=1991, max_value=current_year, value=2020)
+        end_year = st.number_input("End Year", min_value=1991, max_value=current_year, value=current_year)
         
         if start_year > end_year:
             st.error("Error: Start year cannot be after end year.")
@@ -450,13 +517,13 @@ def main():
                 if os.path.exists(checkpoint_file):
                     os.remove(checkpoint_file)
                 with st.spinner("Running deep research pipeline..."):
-                    domains = [d.strip() for d in domains_str.split("\n") if d.strip()]
                     initial_state = {
                         "query": query, 
-                        "domains": domains, 
-                        "num_references_per_domain": num_references,
+                        "publishers": publishers, 
+                        "num_references": num_references,
                         "start_year": start_year,
-                        "end_year": end_year
+                        "end_year": end_year,
+                        "conversation_history": []
                     }
                     final_state = graph.invoke(initial_state)
                     if final_state.get("raptor_index"):
@@ -518,7 +585,7 @@ def main():
             with col2:
                 if st.button("Export Full Bibliography"):
                     bib_pdf_bytes = generate_bibliography_pdf(
-                        all_sources=st.session_state.final_state.get('direct_pdf_urls', [])
+                        papers_by_publisher=st.session_state.final_state.get('papers_by_publisher', {})
                     )
                     st.download_button(label="Download Bibliography PDF", data=bib_pdf_bytes, file_name="full_bibliography.pdf", mime="application/pdf")
 
@@ -526,9 +593,9 @@ def main():
                 final_state = st.session_state.final_state
                 mermaid_code = generate_mermaid_diagram(
                     query=final_state['query'], 
-                    domains=final_state['domains'],
-                    num_refs=final_state['num_references_per_domain'], 
-                    found_urls=len(final_state['direct_pdf_urls']),
+                    publishers=final_state['publishers'],
+                    num_refs=final_state['num_references'], 
+                    papers_by_publisher=final_state['papers_by_publisher'],
                     start_year=final_state['start_year'],
                     end_year=final_state['end_year']
                 )
