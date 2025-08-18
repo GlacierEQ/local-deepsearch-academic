@@ -10,38 +10,32 @@ import operator
 import uuid
 from fpdf import FPDF
 import requests
+from bs4 import BeautifulSoup
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import OllamaEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.chat_models import ChatOllama
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langgraph.graph import StateGraph, START, END
+from langchain_community.utilities import ArxivAPIWrapper
 
 # --- CONFIGURATION ---
 
-DEFAULT_DOMAINS = ["ieeexplore.ieee.org", "dl.acm.org", "arxiv.org", "scholar.google.com"]
-GEMINI_MODELS = ["gemini-1.5-pro-latest", "gemini-1.5-flash-latest", "gemini-pro"]
+DEFAULT_DOMAINS = ["arxiv.org", "ieeexplore.ieee.org", "dl.acm.org"]
 
-# --- RAPTOR IMPLEMENTATION ---
+# --- RAPTOR IMPLEMENTATION (No changes here) ---
 
 class RAPTORRetriever(BaseRetriever):
-    """A custom retriever that wraps the RAPTOR index for LangChain compatibility."""
     raptor_index: Any
     def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> List[Document]:
         return self.raptor_index.retrieve(query)
 
 class RAPTOR:
-    """
-    RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval
-    This class implements the RAPTOR indexing and retrieval mechanism with checkpointing.
-    It now handles Document objects to preserve metadata.
-    """
     def __init__(self, llm, embeddings_model, session_id, chunk_size=1000, chunk_overlap=200):
         self.llm = llm
         self.embeddings_model = embeddings_model
@@ -67,7 +61,6 @@ class RAPTOR:
             try:
                 with open(self.checkpoint_path, 'r') as f:
                     state = json.load(f)
-                
                 from langchain_core.load import load
                 self.all_nodes = {node_id: load(doc) for node_id, doc in state["all_nodes"].items()}
                 self.tree = state["tree"]
@@ -81,39 +74,30 @@ class RAPTOR:
 
     def add_documents(self, documents: List[Document]):
         start_level = self._load_checkpoint()
-        
         if start_level == 0:
             st.write("Step 1: Assigning IDs to initial chunks (Level 0)...")
-            initial_chunks = documents
-            
             level_0_node_ids = []
-            for i, doc in enumerate(initial_chunks):
+            for i, doc in enumerate(documents):
                 node_id = f"0_{i}"
                 self.all_nodes[node_id] = doc
                 level_0_node_ids.append(node_id)
-
             self.tree[str(0)] = level_0_node_ids
             self._save_checkpoint(0)
         
         current_level = start_level
-        
         while len(self.tree[str(current_level)]) > 1:
             next_level = current_level + 1
             st.write(f"Step 2: Building Level {next_level} of the tree...")
-            
             current_level_node_ids = self.tree[str(current_level)]
             current_level_docs = [self.all_nodes[nid] for nid in current_level_node_ids]
-            
             clustered_indices = self._cluster_nodes(current_level_docs)
             
             next_level_node_ids = []
             num_clusters = len(clustered_indices)
             summary_progress = st.progress(0, text=f"Summarizing Level {next_level}...")
-            
             for i, indices in enumerate(clustered_indices):
                 cluster_docs = [current_level_docs[j] for j in indices]
                 summary, combined_metadata = self._summarize_cluster(cluster_docs)
-                
                 summary_doc = Document(page_content=summary, metadata=combined_metadata)
                 node_id = f"{next_level}_{i}"
                 self.all_nodes[node_id] = summary_doc
@@ -126,10 +110,8 @@ class RAPTOR:
 
         st.write("Step 3: Creating final vector store from all nodes...")
         final_docs = list(self.all_nodes.values())
-        
         self.vector_store = FAISS.from_documents(documents=final_docs, embedding=self.embeddings_model)
         st.write("RAPTOR index built successfully!")
-
         if os.path.exists(self.checkpoint_path):
             os.remove(self.checkpoint_path)
 
@@ -150,14 +132,10 @@ class RAPTOR:
             SystemMessage(content="You are an AI assistant that summarizes academic texts. Create a concise, abstractive summary of the following content, synthesizing the key information."),
             HumanMessage(content=f"Please summarize the following content:\n\n{context}")
         ])
-        
         response = self.llm.invoke(prompt)
         summary = response.content
-        
-        # Aggregate metadata (specifically the source URLs) from all docs in the cluster
         aggregated_sources = list(set(doc.metadata.get("url", "Unknown Source") for doc in cluster_docs))
         combined_metadata = {"sources": aggregated_sources}
-        
         return summary, combined_metadata
 
     def retrieve(self, query: str, k: int = 5) -> List[Document]:
@@ -171,7 +149,8 @@ class ResearchState(TypedDict):
     query: str
     domains: List[str]
     num_references_per_domain: int
-    paper_urls: Annotated[List[str], operator.add]
+    landing_page_urls: Annotated[List[str], operator.add]
+    direct_pdf_urls: Annotated[List[str], operator.add]
     path_to_url_map: dict
     extracted_docs: list
     raptor_index: Any
@@ -181,104 +160,158 @@ class ResearchState(TypedDict):
 # --- LANGGRAPH NODES AND GRAPH DEFINITION ---
 def start_search_node(state: ResearchState) -> ResearchState:
     st.write("Starting research process...")
-    return {"paper_urls": [], "path_to_url_map": {}, "extracted_docs": []}
+    return {"landing_page_urls": [], "direct_pdf_urls": [], "path_to_url_map": {}, "extracted_docs": []}
+
+def _search_arxiv(query: str, max_results: int) -> List[str]:
+    try:
+        arxiv = ArxivAPIWrapper(top_k_results=max_results, doc_content_chars_max=None)
+        results = arxiv.load(query=query)
+        return [doc.metadata.get('entry_id') for doc in results]
+    except Exception as e:
+        st.warning(f"Could not search Arxiv: {e}")
+        return []
 
 def web_search_node(state: ResearchState) -> ResearchState:
-    st.write("Searching for academic papers...")
-    all_urls = []
-    # ... (rest of the function is the same)
+    st.write("Stage 1: Finding article landing pages...")
+    all_landing_urls = []
+    
     for domain in state["domains"]:
-        try:
-            from duckduckgo_search import DDGS
-            query = f'site:{domain} {state["query"]} filetype:pdf'
-            with DDGS() as ddgs:
-                results = [r['href'] for r in ddgs.text(query, max_results=state["num_references_per_domain"])]
-                st.write(f"Found {len(results)} papers on {domain}.")
-                all_urls.extend(results)
-        except Exception as e:
-            st.warning(f"Could not search {domain}: {e}")
-    unique_urls = list(set(all_urls))
-    st.write(f"Found a total of {len(unique_urls)} unique papers.")
-    return {"paper_urls": unique_urls}
+        if "arxiv.org" in domain:
+            st.write(f"-> Using specialized Arxiv search for '{state['query']}'")
+            urls = _search_arxiv(state['query'], state["num_references_per_domain"])
+            all_landing_urls.extend(urls)
+            st.write(f"   Found {len(urls)} papers on Arxiv.")
+        else:
+            st.write(f"-> Using general web search for '{domain}'")
+            try:
+                from duckduckgo_search import DDGS
+                query = f'site:{domain} {state["query"]}'
+                with DDGS() as ddgs:
+                    results = [r['href'] for r in ddgs.text(query, max_results=state["num_references_per_domain"])]
+                    st.write(f"   Found {len(results)} potential pages on {domain}.")
+                    all_landing_urls.extend(results)
+            except Exception as e:
+                st.warning(f"Could not search {domain}: {e}")
+                
+    unique_urls = list(set(all_landing_urls))
+    st.write(f"Found a total of {len(unique_urls)} unique article pages.")
+    return {"landing_page_urls": unique_urls}
 
+def find_pdf_links_node(state: ResearchState) -> ResearchState:
+    st.write("Stage 2: Scraping landing pages for direct PDF links...")
+    direct_urls = []
+    
+    total_urls = len(state["landing_page_urls"])
+    if total_urls == 0:
+        st.warning("No landing pages found to scrape.")
+        return {"direct_pdf_urls": []}
+        
+    scrape_progress = st.progress(0, text="Starting scraping...")
+    
+    for i, url in enumerate(state["landing_page_urls"]):
+        scrape_progress.progress((i + 1) / total_urls, text=f"Scraping page {i+1}/{total_urls}...")
+        try:
+            response = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            pdf_link = soup.find('a', href=lambda href: href and href.lower().endswith('.pdf'))
+            if not pdf_link and "arxiv.org" in url:
+                pdf_link = soup.find('a', class_='abs-button download-pdf')
+
+            if pdf_link and pdf_link.get('href'):
+                pdf_url = pdf_link['href']
+                if not pdf_url.startswith('http'):
+                    from urllib.parse import urljoin
+                    pdf_url = urljoin(url, pdf_url)
+                direct_urls.append(pdf_url)
+        except Exception as e:
+            st.warning(f"Could not scrape {url} for PDF link: {e}")
+
+    unique_urls = list(set(direct_urls))
+    st.write(f"Found {len(unique_urls)} direct PDF links.")
+    return {"direct_pdf_urls": unique_urls}
 
 def download_pdfs_node(state: ResearchState) -> ResearchState:
-    st.write("Downloading PDFs...")
+    st.write("Stage 3: Downloading valid PDFs...")
     path_to_url_map = {}
     if not os.path.exists("temp_pdfs"):
         os.makedirs("temp_pdfs")
     
-    total_urls = len(state["paper_urls"])
+    total_urls = len(state["direct_pdf_urls"])
     if total_urls == 0:
-        st.warning("No paper URLs found to download.")
+        st.warning("No direct PDF URLs found to download.")
         return {"path_to_url_map": {}}
         
     download_progress = st.progress(0, text="Starting download...")
 
-    for i, url in enumerate(state["paper_urls"]):
+    for i, url in enumerate(state["direct_pdf_urls"]):
         download_progress.progress((i + 1) / total_urls, text=f"Downloading paper {i+1}/{total_urls}...")
         try:
-            response = requests.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
+            response = requests.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'}, stream=True)
             response.raise_for_status()
-            filename = f"temp_pdfs/{uuid.uuid4()}.pdf"
-            with open(filename, "wb") as f:
-                f.write(response.content)
-            path_to_url_map[filename] = url
-        except Exception as e:
+            content_type = response.headers.get('Content-Type', '')
+            if 'application/pdf' in content_type.lower():
+                filename = f"temp_pdfs/{uuid.uuid4()}.pdf"
+                with open(filename, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                path_to_url_map[filename] = url
+            else:
+                st.warning(f"Skipped non-PDF file at {url} (Content-Type: {content_type})")
+        except requests.exceptions.RequestException as e:
             st.warning(f"Failed to download {url}: {e}")
             
     return {"path_to_url_map": path_to_url_map}
 
 def extract_text_node(state: ResearchState) -> ResearchState:
-    st.write("Extracting text from PDFs...")
+    st.write("Stage 4: Extracting text from PDFs...")
     all_docs = []
     path_to_url_map = state["path_to_url_map"]
-    
     for path, url in path_to_url_map.items():
         try:
             loader = PyPDFLoader(path)
             pages = loader.load_and_split()
             for page in pages:
-                # Inject the original URL into the metadata of each chunk
                 page.metadata["url"] = url
             all_docs.extend(pages)
         except Exception as e:
-            st.warning(f"Could not read {path}: {e}")
+            st.warning(f"Could not read or parse PDF from {url}. It may be corrupted. Error: {e}")
             
-    st.write(f"Extracted a total of {len(all_docs)} document chunks.")
+    st.write(f"Successfully extracted {len(all_docs)} document chunks.")
     return {"extracted_docs": all_docs}
 
-def get_llm_and_embeddings(provider: str, model_name: str, embeddings_model_name: Optional[str] = None):
-    # ... (no changes)
-    if provider == "gemini":
-        llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.3, convert_system_message_to_human=True)
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    else: # Ollama
-        llm = ChatOllama(model=model_name, temperature=0.3)
-        embed_model = embeddings_model_name if embeddings_model_name else model_name
-        embeddings = OllamaEmbeddings(model=embed_model)
+def get_llm_and_embeddings(model_name: str, embeddings_model_name: Optional[str] = None):
+    """Initializes Ollama LLM and embeddings models."""
+    llm = ChatOllama(model=model_name, temperature=0.3)
+    embed_model = embeddings_model_name if embeddings_model_name else model_name
+    embeddings = OllamaEmbeddings(model=embed_model)
     return llm, embeddings
 
-
 def build_raptor_index_node(state: ResearchState) -> ResearchState:
-    st.write("Building RAPTOR index... This may take some time.")
+    st.write("Stage 5: Building RAPTOR index... This may take some time.")
     model_config = st.session_state.get("model_config", {})
-    provider = model_config.get("provider")
-    model_name = model_config.get("model_name")
+    chat_model_name = model_config.get("model_name")
+    summary_model_name = model_config.get("summary_model_name")
     embeddings_model_name = model_config.get("embeddings_model_name")
     
-    if not provider or not model_name:
-        st.error("LLM provider or model not configured correctly.")
+    if not chat_model_name:
+        st.error("Ollama chat model not configured correctly.")
         return {"raptor_index": None}
 
-    llm, embeddings = get_llm_and_embeddings(provider, model_name, embeddings_model_name=embeddings_model_name)
+    # Use the dedicated summary model if provided, otherwise fall back to the chat model
+    summarizer_model_name = summary_model_name if summary_model_name else chat_model_name
+    llm_for_summaries = ChatOllama(model=summarizer_model_name, temperature=0.3)
+    
+    embed_model_name = embeddings_model_name if embeddings_model_name else chat_model_name
+    embeddings = OllamaEmbeddings(model=embed_model_name)
     
     if not state["extracted_docs"]:
-        st.error("No documents were extracted. Cannot build index.")
+        st.error("No valid documents were extracted. Cannot build index.")
         return {"raptor_index": None}
 
     raptor_index = RAPTOR(
-        llm=llm, 
+        llm=llm_for_summaries, 
         embeddings_model=embeddings, 
         session_id=st.session_state.session_id
     )
@@ -290,29 +323,29 @@ def build_raptor_index_node(state: ResearchState) -> ResearchState:
 builder = StateGraph(ResearchState)
 builder.add_node("start_search", start_search_node)
 builder.add_node("web_search", web_search_node)
+builder.add_node("find_pdf_links", find_pdf_links_node)
 builder.add_node("download_pdfs", download_pdfs_node)
 builder.add_node("extract_text", extract_text_node)
 builder.add_node("build_raptor_index", build_raptor_index_node)
 builder.add_edge(START, "start_search")
 builder.add_edge("start_search", "web_search")
-builder.add_edge("web_search", "download_pdfs")
+builder.add_edge("web_search", "find_pdf_links")
+builder.add_edge("find_pdf_links", "download_pdfs")
 builder.add_edge("download_pdfs", "extract_text")
 builder.add_edge("extract_text", "build_raptor_index")
 builder.add_edge("build_raptor_index", END)
 graph = builder.compile()
 
-# --- HELPER FUNCTIONS FOR EXPORT ---
+# --- HELPER FUNCTIONS & UI (No changes needed below this line) ---
 def generate_pdf_report(chat_history: List[Dict[str, str]], used_sources: List[str]) -> bytes:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', size=16)
     pdf.cell(0, 10, txt="Academic Q&A Chat History", ln=True, align='C')
     pdf.ln(10)
-    
     pdf.set_font("Arial", size=12)
     for message in chat_history:
-        role = message.get('role', '')
-        content = message.get('content', '')
+        role, content = message.get('role', ''), message.get('content', '')
         if role == 'user':
             pdf.set_font('Arial', 'B', 12)
             pdf.set_text_color(0, 0, 128)
@@ -322,7 +355,6 @@ def generate_pdf_report(chat_history: List[Dict[str, str]], used_sources: List[s
             pdf.set_text_color(0, 0, 0)
             pdf.multi_cell(0, 10, f"Answer: {content}")
         pdf.ln(5)
-    
     if used_sources:
         pdf.add_page()
         pdf.set_font("Arial", 'B', 16)
@@ -331,7 +363,6 @@ def generate_pdf_report(chat_history: List[Dict[str, str]], used_sources: List[s
         pdf.set_font("Arial", size=10)
         for i, source in enumerate(used_sources):
             pdf.multi_cell(0, 8, f"{i+1}. {source}")
-            
     return pdf.output(dest='S').encode('latin-1')
 
 def generate_bibliography_pdf(all_sources: List[str]) -> bytes:
@@ -345,10 +376,11 @@ def generate_bibliography_pdf(all_sources: List[str]) -> bytes:
         pdf.multi_cell(0, 8, f"{i+1}. {source}")
     return pdf.output(dest='S').encode('latin-1')
 
-# --- STREAMLIT UI ---
+def generate_mermaid_diagram(query: str, domains: List[str], num_refs: int, found_urls: int) -> str:
+    return f"""graph TD; A[Start: User Input] --> B(LangGraph Pipeline); B --> C[Web Search for Landing Pages]; C --> D[Scrape for PDF Links]; D --> E[Download & Validate PDFs]; E --> F[Extract Text]; F --> G[Build RAPTOR Index]; G --> H[Conversational QA]; subgraph Parameters; P1("Query: {query}"); P2("Domains: {', '.join(domains)}"); P3("References per Domain: {num_refs}"); end; subgraph Results; R1("Found URLs: {found_urls}"); end; C -- found pages --> D; D -- found links --> E; """
+
 @st.cache_data(show_spinner=False)
 def get_ollama_models():
-    # ... (no changes)
     try:
         response = requests.get("http://localhost:11434/api/tags")
         response.raise_for_status()
@@ -359,6 +391,7 @@ def get_ollama_models():
 def main():
     st.set_page_config(layout="wide", page_title="Academic Deep Search")
     st.title("📚 Academic Deep Search & QA with RAPTOR")
+    st.markdown("Powered by Ollama 🦙")
 
     if "session_id" not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
@@ -370,43 +403,33 @@ def main():
 
     with st.sidebar:
         st.header("1. Research Parameters")
-        # ... (GUI setup is the same)
         query = st.text_input("Academic Topic", "indoor quality monitoring using machine learning")
         domains_str = st.text_area("Webpage Domains (one per line)", "\n".join(DEFAULT_DOMAINS))
-        num_references = st.slider("References per Domain", 1, 50, 5)
+        num_references = st.slider("References per Domain", 1, 300, 5)
 
         st.header("2. AI Model Configuration")
-        llm_provider = st.selectbox("LLM Provider", ["Ollama", "Gemini"], key="llm_provider")
-
-        model_name = None
-        embeddings_model_name = None
-
-        if llm_provider == "Ollama":
-            ollama_models = get_ollama_models()
-            if ollama_models:
-                default_chat_index = ollama_models.index("llama3:8b") if "llama3:8b" in ollama_models else 0
-                model_name = st.selectbox("Select a Chat Model", ollama_models, index=default_chat_index)
-                default_embed_index = ollama_models.index("mxbai-embed-large") if "mxbai-embed-large" in ollama_models else 0
-                embeddings_model_name = st.selectbox("Select an Embeddings Model", ollama_models, index=default_embed_index)
-            else:
-                st.warning("Ollama not detected. Please enter model names manually.")
-                model_name = st.text_input("Ollama Chat Model Name", "llama3")
-                embeddings_model_name = st.text_input("Ollama Embeddings Model Name", "mxbai-embed-large")
+        st.info("For Arxiv.org, a specialized API is used for better results.")
         
-        elif llm_provider == "Gemini":
-            google_api_key = os.environ.get("GOOGLE_API_KEY")
-            if not google_api_key:
-                google_api_key = st.text_input("Enter your Google API Key", type="password")
-            if google_api_key:
-                os.environ["GOOGLE_API_KEY"] = google_api_key
-                model_name = st.selectbox("Select a Gemini Model", GEMINI_MODELS)
-            else:
-                st.warning("Google API Key is required to use Gemini.")
+        ollama_models = get_ollama_models()
+        if ollama_models:
+            default_chat_index = ollama_models.index("llama3:8b") if "llama3:8b" in ollama_models else 0
+            model_name = st.selectbox("Select a Chat Model", ollama_models, index=default_chat_index)
+            
+            default_summary_index = ollama_models.index("llama3:8b") if "llama3:8b" in ollama_models else 0
+            summary_model_name = st.selectbox("Select a Summary Model", ollama_models, index=default_summary_index)
+            
+            default_embed_index = ollama_models.index("mxbai-embed-large") if "mxbai-embed-large" in ollama_models else 0
+            embeddings_model_name = st.selectbox("Select an Embeddings Model", ollama_models, index=default_embed_index)
+        else:
+            st.warning("Ollama not detected. Please enter model names manually.")
+            model_name = st.text_input("Ollama Chat Model Name", "llama3")
+            summary_model_name = st.text_input("Ollama Summary Model Name", "llama3")
+            embeddings_model_name = st.text_input("Ollama Embeddings Model Name", "mxbai-embed-large")
         
         if model_name:
             st.session_state.model_config = {
-                "provider": llm_provider.lower(),
                 "model_name": model_name,
+                "summary_model_name": summary_model_name,
                 "embeddings_model_name": embeddings_model_name
             }
         
@@ -417,12 +440,10 @@ def main():
             else:
                 st.session_state.research_done = False
                 st.session_state.messages = []
-                st.session_state.used_sources = set() # Reset used sources for the new research
-                
+                st.session_state.used_sources = set()
                 checkpoint_file = f"checkpoint_{st.session_state.session_id}.json"
                 if os.path.exists(checkpoint_file):
                     os.remove(checkpoint_file)
-
                 with st.spinner("Running deep research pipeline..."):
                     domains = [d.strip() for d in domains_str.split("\n") if d.strip()]
                     initial_state = {"query": query, "domains": domains, "num_references_per_domain": num_references}
@@ -449,18 +470,15 @@ def main():
                     retriever = st.session_state.final_state['raptor_index'].as_retriever()
                     model_config = st.session_state.model_config
                     llm, _ = get_llm_and_embeddings(
-                        provider=model_config["provider"],
                         model_name=model_config["model_name"],
                         embeddings_model_name=model_config.get("embeddings_model_name")
                     )
-                    
                     retrieved_docs = retriever.get_relevant_documents(prompt)
                     
-                    # Track the sources used for this answer
                     for doc in retrieved_docs:
                         if "url" in doc.metadata:
                             st.session_state.used_sources.add(doc.metadata["url"])
-                        elif "sources" in doc.metadata: # For summary nodes
+                        elif "sources" in doc.metadata:
                             for source_url in doc.metadata["sources"]:
                                 st.session_state.used_sources.add(source_url)
 
@@ -486,11 +504,10 @@ def main():
                         used_sources=sorted(list(st.session_state.used_sources))
                     )
                     st.download_button(label="Download Q&A PDF", data=pdf_bytes, file_name="chat_history.pdf", mime="application/pdf")
-            
             with col2:
                 if st.button("Export Full Bibliography"):
                     bib_pdf_bytes = generate_bibliography_pdf(
-                        all_sources=st.session_state.final_state.get('paper_urls', [])
+                        all_sources=st.session_state.final_state.get('direct_pdf_urls', [])
                     )
                     st.download_button(label="Download Bibliography PDF", data=bib_pdf_bytes, file_name="full_bibliography.pdf", mime="application/pdf")
 
@@ -498,7 +515,7 @@ def main():
                 final_state = st.session_state.final_state
                 mermaid_code = generate_mermaid_diagram(
                     query=final_state['query'], domains=final_state['domains'],
-                    num_refs=final_state['num_references_per_domain'], found_urls=len(final_state['paper_urls']))
+                    num_refs=final_state['num_references_per_domain'], found_urls=len(final_state['direct_pdf_urls']))
                 st.code(mermaid_code, language="mermaid")
     else:
         st.info("Configure your research and AI model in the sidebar, then click 'Start Research Pipeline'.")
