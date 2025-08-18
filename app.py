@@ -25,16 +25,14 @@ from langgraph.graph import StateGraph, START, END
 
 # --- CONFIGURATION ---
 
-# Default academic domains to search
 DEFAULT_DOMAINS = ["ieeexplore.ieee.org", "dl.acm.org", "arxiv.org", "scholar.google.com"]
-GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"]
+GEMINI_MODELS = ["gemini-1.5-pro-latest", "gemini-1.5-flash-latest", "gemini-pro"]
 
 # --- RAPTOR IMPLEMENTATION ---
 
 class RAPTORRetriever(BaseRetriever):
     """A custom retriever that wraps the RAPTOR index for LangChain compatibility."""
     raptor_index: Any
-    
     def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> List[Document]:
         return self.raptor_index.retrieve(query)
 
@@ -42,6 +40,7 @@ class RAPTOR:
     """
     RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval
     This class implements the RAPTOR indexing and retrieval mechanism with checkpointing.
+    It now handles Document objects to preserve metadata.
     """
     def __init__(self, llm, embeddings_model, session_id, chunk_size=1000, chunk_overlap=200):
         self.llm = llm
@@ -49,51 +48,52 @@ class RAPTOR:
         self.session_id = session_id
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         self.tree = {}
-        self.all_nodes = {}
+        self.all_nodes: Dict[str, Document] = {}
         self.vector_store = None
-        self.node_ids = []
         self.checkpoint_path = f"checkpoint_{self.session_id}.json"
 
     def _save_checkpoint(self, level):
-        """Saves the current state of the tree to a file."""
         state = {
             "level": level,
-            "tree": {str(k): v for k, v in self.tree.items()}, # Ensure keys are strings
-            "all_nodes": self.all_nodes,
+            "tree": {str(k): [node_id for node_id in v] for k, v in self.tree.items()},
+            "all_nodes": {node_id: doc.to_json() for node_id, doc in self.all_nodes.items()},
         }
         with open(self.checkpoint_path, 'w') as f:
             json.dump(state, f)
         st.write(f"Checkpoint saved for level {level}.")
 
     def _load_checkpoint(self) -> int:
-        """Loads the state from a checkpoint file if it exists."""
         if os.path.exists(self.checkpoint_path):
             try:
                 with open(self.checkpoint_path, 'r') as f:
                     state = json.load(f)
+                
+                from langchain_core.load import load
+                self.all_nodes = {node_id: load(doc) for node_id, doc in state["all_nodes"].items()}
                 self.tree = state["tree"]
-                self.all_nodes = state["all_nodes"]
                 start_level = state["level"]
                 st.info(f"Resuming from checkpoint at level {start_level}.")
                 return start_level
-            except (json.JSONDecodeError, KeyError) as e:
+            except Exception as e:
                 st.warning(f"Could not load checkpoint file due to error: {e}. Starting from scratch.")
                 return 0
         return 0
 
-    def add_documents(self, text: str):
+    def add_documents(self, documents: List[Document]):
         start_level = self._load_checkpoint()
         
         if start_level == 0:
-            st.write("Step 1: Splitting text into initial chunks (Level 0)...")
-            initial_chunks = self.text_splitter.create_documents([text])
-            level_0_texts = [doc.page_content for doc in initial_chunks]
+            st.write("Step 1: Assigning IDs to initial chunks (Level 0)...")
+            initial_chunks = documents
             
-            for i, chunk_text in enumerate(level_0_texts):
-                self.all_nodes[f"0_{i}"] = chunk_text
-            
-            self.tree[str(0)] = level_0_texts
-            self._save_checkpoint(0) # Save initial state
+            level_0_node_ids = []
+            for i, doc in enumerate(initial_chunks):
+                node_id = f"0_{i}"
+                self.all_nodes[node_id] = doc
+                level_0_node_ids.append(node_id)
+
+            self.tree[str(0)] = level_0_node_ids
+            self._save_checkpoint(0)
         
         current_level = start_level
         
@@ -101,57 +101,64 @@ class RAPTOR:
             next_level = current_level + 1
             st.write(f"Step 2: Building Level {next_level} of the tree...")
             
-            current_level_nodes = self.tree[str(current_level)]
-            clustered_indices = self._cluster_nodes(current_level_nodes)
+            current_level_node_ids = self.tree[str(current_level)]
+            current_level_docs = [self.all_nodes[nid] for nid in current_level_node_ids]
             
-            next_level_nodes = []
+            clustered_indices = self._cluster_nodes(current_level_docs)
+            
+            next_level_node_ids = []
             num_clusters = len(clustered_indices)
             summary_progress = st.progress(0, text=f"Summarizing Level {next_level}...")
             
             for i, indices in enumerate(clustered_indices):
-                summary = self._summarize_cluster([current_level_nodes[j] for j in indices])
-                next_level_nodes.append(summary)
-                self.all_nodes[f"{next_level}_{i}"] = summary
+                cluster_docs = [current_level_docs[j] for j in indices]
+                summary, combined_metadata = self._summarize_cluster(cluster_docs)
+                
+                summary_doc = Document(page_content=summary, metadata=combined_metadata)
+                node_id = f"{next_level}_{i}"
+                self.all_nodes[node_id] = summary_doc
+                next_level_node_ids.append(node_id)
                 summary_progress.progress((i + 1) / num_clusters, text=f"Summarizing cluster {i+1}/{num_clusters} for Level {next_level}...")
             
-            self.tree[str(next_level)] = next_level_nodes
+            self.tree[str(next_level)] = next_level_node_ids
             self._save_checkpoint(next_level)
             current_level = next_level
 
         st.write("Step 3: Creating final vector store from all nodes...")
-        self.node_ids = list(self.all_nodes.keys())
-        node_texts = list(self.all_nodes.values())
+        final_docs = list(self.all_nodes.values())
         
-        self.vector_store = FAISS.from_texts(texts=node_texts, embedding=self.embeddings_model)
+        self.vector_store = FAISS.from_documents(documents=final_docs, embedding=self.embeddings_model)
         st.write("RAPTOR index built successfully!")
 
         if os.path.exists(self.checkpoint_path):
             os.remove(self.checkpoint_path)
 
-    def _cluster_nodes(self, node_texts: List[str]) -> List[List[int]]:
-        st.write(f"Embedding {len(node_texts)} nodes for clustering...")
-        embeddings = self.embeddings_model.embed_documents(node_texts)
-        
-        n_clusters = max(2, len(node_texts) // 10)
-        
+    def _cluster_nodes(self, docs: List[Document]) -> List[List[int]]:
+        st.write(f"Embedding {len(docs)} nodes for clustering...")
+        embeddings = self.embeddings_model.embed_documents([doc.page_content for doc in docs])
+        n_clusters = max(2, len(docs) // 10)
         st.write(f"Clustering into {n_clusters} groups...")
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto').fit(embeddings)
-        
         clusters = [[] for _ in range(n_clusters)]
         for i, label in enumerate(kmeans.labels_):
             clusters[label].append(i)
-            
         return clusters
 
-    def _summarize_cluster(self, cluster_texts: List[str]) -> str:
-        context = "\n\n---\n\n".join(cluster_texts)
+    def _summarize_cluster(self, cluster_docs: List[Document]) -> Tuple[str, dict]:
+        context = "\n\n---\n\n".join([doc.page_content for doc in cluster_docs])
         prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content="You are an AI assistant that summarizes academic texts. Create a concise, abstractive summary of the following content, synthesizing the key information."),
             HumanMessage(content=f"Please summarize the following content:\n\n{context}")
         ])
         
         response = self.llm.invoke(prompt)
-        return response.content
+        summary = response.content
+        
+        # Aggregate metadata (specifically the source URLs) from all docs in the cluster
+        aggregated_sources = list(set(doc.metadata.get("url", "Unknown Source") for doc in cluster_docs))
+        combined_metadata = {"sources": aggregated_sources}
+        
+        return summary, combined_metadata
 
     def retrieve(self, query: str, k: int = 5) -> List[Document]:
         return self.vector_store.similarity_search(query, k=k) if self.vector_store else []
@@ -165,8 +172,8 @@ class ResearchState(TypedDict):
     domains: List[str]
     num_references_per_domain: int
     paper_urls: Annotated[List[str], operator.add]
-    downloaded_pdf_paths: Annotated[List[str], operator.add]
-    extracted_text: str
+    path_to_url_map: dict
+    extracted_docs: list
     raptor_index: Any
     conversation_history: Annotated[List[BaseMessage], operator.add]
     generation: str
@@ -174,11 +181,12 @@ class ResearchState(TypedDict):
 # --- LANGGRAPH NODES AND GRAPH DEFINITION ---
 def start_search_node(state: ResearchState) -> ResearchState:
     st.write("Starting research process...")
-    return {"paper_urls": [], "downloaded_pdf_paths": [], "extracted_text": ""}
+    return {"paper_urls": [], "path_to_url_map": {}, "extracted_docs": []}
 
 def web_search_node(state: ResearchState) -> ResearchState:
     st.write("Searching for academic papers...")
     all_urls = []
+    # ... (rest of the function is the same)
     for domain in state["domains"]:
         try:
             from duckduckgo_search import DDGS
@@ -193,16 +201,17 @@ def web_search_node(state: ResearchState) -> ResearchState:
     st.write(f"Found a total of {len(unique_urls)} unique papers.")
     return {"paper_urls": unique_urls}
 
+
 def download_pdfs_node(state: ResearchState) -> ResearchState:
     st.write("Downloading PDFs...")
-    pdf_paths = []
+    path_to_url_map = {}
     if not os.path.exists("temp_pdfs"):
         os.makedirs("temp_pdfs")
     
     total_urls = len(state["paper_urls"])
     if total_urls == 0:
         st.warning("No paper URLs found to download.")
-        return {"downloaded_pdf_paths": []}
+        return {"path_to_url_map": {}}
         
     download_progress = st.progress(0, text="Starting download...")
 
@@ -214,26 +223,33 @@ def download_pdfs_node(state: ResearchState) -> ResearchState:
             filename = f"temp_pdfs/{uuid.uuid4()}.pdf"
             with open(filename, "wb") as f:
                 f.write(response.content)
-            pdf_paths.append(filename)
+            path_to_url_map[filename] = url
         except Exception as e:
             st.warning(f"Failed to download {url}: {e}")
             
-    return {"downloaded_pdf_paths": pdf_paths}
+    return {"path_to_url_map": path_to_url_map}
 
 def extract_text_node(state: ResearchState) -> ResearchState:
     st.write("Extracting text from PDFs...")
-    full_text = ""
-    for path in state["downloaded_pdf_paths"]:
+    all_docs = []
+    path_to_url_map = state["path_to_url_map"]
+    
+    for path, url in path_to_url_map.items():
         try:
             loader = PyPDFLoader(path)
             pages = loader.load_and_split()
-            full_text += "\n\n".join([page.page_content for page in pages])
+            for page in pages:
+                # Inject the original URL into the metadata of each chunk
+                page.metadata["url"] = url
+            all_docs.extend(pages)
         except Exception as e:
             st.warning(f"Could not read {path}: {e}")
-    st.write(f"Extracted a total of {len(full_text)} characters.")
-    return {"extracted_text": full_text}
+            
+    st.write(f"Extracted a total of {len(all_docs)} document chunks.")
+    return {"extracted_docs": all_docs}
 
 def get_llm_and_embeddings(provider: str, model_name: str, embeddings_model_name: Optional[str] = None):
+    # ... (no changes)
     if provider == "gemini":
         llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.3, convert_system_message_to_human=True)
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
@@ -242,6 +258,7 @@ def get_llm_and_embeddings(provider: str, model_name: str, embeddings_model_name
         embed_model = embeddings_model_name if embeddings_model_name else model_name
         embeddings = OllamaEmbeddings(model=embed_model)
     return llm, embeddings
+
 
 def build_raptor_index_node(state: ResearchState) -> ResearchState:
     st.write("Building RAPTOR index... This may take some time.")
@@ -256,8 +273,8 @@ def build_raptor_index_node(state: ResearchState) -> ResearchState:
 
     llm, embeddings = get_llm_and_embeddings(provider, model_name, embeddings_model_name=embeddings_model_name)
     
-    if not state["extracted_text"]:
-        st.error("No text was extracted from PDFs. Cannot build index.")
+    if not state["extracted_docs"]:
+        st.error("No documents were extracted. Cannot build index.")
         return {"raptor_index": None}
 
     raptor_index = RAPTOR(
@@ -265,7 +282,7 @@ def build_raptor_index_node(state: ResearchState) -> ResearchState:
         embeddings_model=embeddings, 
         session_id=st.session_state.session_id
     )
-    raptor_index.add_documents(state["extracted_text"])
+    raptor_index.add_documents(state["extracted_docs"])
     
     st.success("Research and indexing complete! You can now ask questions.")
     return {"raptor_index": raptor_index}
@@ -285,29 +302,53 @@ builder.add_edge("build_raptor_index", END)
 graph = builder.compile()
 
 # --- HELPER FUNCTIONS FOR EXPORT ---
-def generate_pdf_report(chat_history: List[Dict[str, str]]) -> bytes:
+def generate_pdf_report(chat_history: List[Dict[str, str]], used_sources: List[str]) -> bytes:
     pdf = FPDF()
     pdf.add_page()
+    pdf.set_font("Arial", 'B', size=16)
+    pdf.cell(0, 10, txt="Academic Q&A Chat History", ln=True, align='C')
+    pdf.ln(10)
+    
     pdf.set_font("Arial", size=12)
-    pdf.cell(200, 10, txt="Academic QA Chat History", ln=True, align='C')
     for message in chat_history:
         role = message.get('role', '')
         content = message.get('content', '')
         if role == 'user':
-            pdf.set_text_color(0, 0, 255)
+            pdf.set_font('Arial', 'B', 12)
+            pdf.set_text_color(0, 0, 128)
             pdf.multi_cell(0, 10, f"Question: {content}")
         else:
+            pdf.set_font('Arial', '', 12)
             pdf.set_text_color(0, 0, 0)
             pdf.multi_cell(0, 10, f"Answer: {content}")
         pdf.ln(5)
+    
+    if used_sources:
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(0, 10, txt="References", ln=True, align='L')
+        pdf.ln(5)
+        pdf.set_font("Arial", size=10)
+        for i, source in enumerate(used_sources):
+            pdf.multi_cell(0, 8, f"{i+1}. {source}")
+            
     return pdf.output(dest='S').encode('latin-1')
 
-def generate_mermaid_diagram(query: str, domains: List[str], num_refs: int, found_urls: int) -> str:
-    return f"""graph TD; A[Start: User Input] --> B(LangGraph Pipeline); B --> C[Web Search]; C --> D[Download PDFs]; D --> E[Extract Text]; E --> F[Build RAPTOR Index]; F --> G[Conversational QA]; subgraph Parameters; P1("Query: {query}"); P2("Domains: {', '.join(domains)}"); P3("References per Domain: {num_refs}"); end; subgraph Results; R1("Found URLs: {found_urls}"); end; A -- Parameters --> P1 & P2 & P3; C -- Results --> R1;"""
+def generate_bibliography_pdf(all_sources: List[str]) -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', size=16)
+    pdf.cell(0, 10, txt="Full Bibliography of Scraped Articles", ln=True, align='C')
+    pdf.ln(10)
+    pdf.set_font("Arial", size=10)
+    for i, source in enumerate(all_sources):
+        pdf.multi_cell(0, 8, f"{i+1}. {source}")
+    return pdf.output(dest='S').encode('latin-1')
 
 # --- STREAMLIT UI ---
 @st.cache_data(show_spinner=False)
 def get_ollama_models():
+    # ... (no changes)
     try:
         response = requests.get("http://localhost:11434/api/tags")
         response.raise_for_status()
@@ -325,9 +366,11 @@ def main():
         st.session_state.research_done = False
         st.session_state.final_state = None
         st.session_state.model_config = {}
+        st.session_state.used_sources = set()
 
     with st.sidebar:
         st.header("1. Research Parameters")
+        # ... (GUI setup is the same)
         query = st.text_input("Academic Topic", "indoor quality monitoring using machine learning")
         domains_str = st.text_area("Webpage Domains (one per line)", "\n".join(DEFAULT_DOMAINS))
         num_references = st.slider("References per Domain", 1, 50, 5)
@@ -341,11 +384,8 @@ def main():
         if llm_provider == "Ollama":
             ollama_models = get_ollama_models()
             if ollama_models:
-                # Suggest a common chat model as default if available.
                 default_chat_index = ollama_models.index("llama3:8b") if "llama3:8b" in ollama_models else 0
                 model_name = st.selectbox("Select a Chat Model", ollama_models, index=default_chat_index)
-                
-                # Suggest a common embeddings model as default if available.
                 default_embed_index = ollama_models.index("mxbai-embed-large") if "mxbai-embed-large" in ollama_models else 0
                 embeddings_model_name = st.selectbox("Select an Embeddings Model", ollama_models, index=default_embed_index)
             else:
@@ -377,9 +417,8 @@ def main():
             else:
                 st.session_state.research_done = False
                 st.session_state.messages = []
+                st.session_state.used_sources = set() # Reset used sources for the new research
                 
-                # Clear any old checkpoints from previous runs, but not for the current session
-                # This button click signifies a new research task
                 checkpoint_file = f"checkpoint_{st.session_state.session_id}.json"
                 if os.path.exists(checkpoint_file):
                     os.remove(checkpoint_file)
@@ -415,14 +454,22 @@ def main():
                         embeddings_model_name=model_config.get("embeddings_model_name")
                     )
                     
+                    retrieved_docs = retriever.get_relevant_documents(prompt)
+                    
+                    # Track the sources used for this answer
+                    for doc in retrieved_docs:
+                        if "url" in doc.metadata:
+                            st.session_state.used_sources.add(doc.metadata["url"])
+                        elif "sources" in doc.metadata: # For summary nodes
+                            for source_url in doc.metadata["sources"]:
+                                st.session_state.used_sources.add(source_url)
+
+                    context = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
+                    
                     prompt_template = ChatPromptTemplate.from_messages([
                         ("system", "You are an AI research assistant. Answer based on the following context from academic papers:\n\n{context}\n\nIf the answer isn't in the context, say so."),
                         ("human", "{question}")
                     ])
-                    
-                    retrieved_docs = retriever.get_relevant_documents(prompt)
-                    context = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
-                    
                     chain = prompt_template | llm
                     response = chain.invoke({"context": context, "question": prompt})
                     response_content = response.content
@@ -431,9 +478,21 @@ def main():
             st.session_state.messages.append({"role": "assistant", "content": response_content})
         
         with st.expander("Export Options"):
-            if st.button("Export Chat as PDF"):
-                pdf_bytes = generate_pdf_report(st.session_state.messages)
-                st.download_button(label="Download PDF", data=pdf_bytes, file_name="chat_history.pdf", mime="application/pdf")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Export Chat & Used References"):
+                    pdf_bytes = generate_pdf_report(
+                        chat_history=st.session_state.messages, 
+                        used_sources=sorted(list(st.session_state.used_sources))
+                    )
+                    st.download_button(label="Download Q&A PDF", data=pdf_bytes, file_name="chat_history.pdf", mime="application/pdf")
+            
+            with col2:
+                if st.button("Export Full Bibliography"):
+                    bib_pdf_bytes = generate_bibliography_pdf(
+                        all_sources=st.session_state.final_state.get('paper_urls', [])
+                    )
+                    st.download_button(label="Download Bibliography PDF", data=bib_pdf_bytes, file_name="full_bibliography.pdf", mime="application/pdf")
 
             if st.button("Generate Pipeline Diagram"):
                 final_state = st.session_state.final_state
@@ -441,7 +500,6 @@ def main():
                     query=final_state['query'], domains=final_state['domains'],
                     num_refs=final_state['num_references_per_domain'], found_urls=len(final_state['paper_urls']))
                 st.code(mermaid_code, language="mermaid")
-                st.info("Copy this code and render it in a Mermaid.js compatible viewer.")
     else:
         st.info("Configure your research and AI model in the sidebar, then click 'Start Research Pipeline'.")
 
