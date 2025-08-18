@@ -1,4 +1,3 @@
-
 import streamlit as st
 import os
 import numpy as np
@@ -15,8 +14,6 @@ import re
 import base64
 import tempfile
 import time
-
-import arxiv
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
@@ -41,12 +38,12 @@ DEFAULT_PUBLISHERS = ["IEEE", "ACM", "Springer", "Elsevier", "IEEE Explorer", "I
 def create_mock_data() -> List[Dict[str, Any]]:
     """Generates a list of fake paper data for debugging."""
     mock_papers = [
-        {"url": "http://arxiv.org/abs/2401.0001", "title": "Advanced LSTM Networks for Indoor Air Quality Prediction - IEEE Transactions", "snippet": "Published in IEEE Transactions on ..."},
-        {"url": "http://arxiv.org/abs/2401.0002", "title": "A Transformer-based Model for Real-time Pollutant Forecasting", "snippet": "A publication by ACM..."},
-        {"url": "http://arxiv.org/abs/2401.0003", "title": "Machine Learning Approaches for Low-Cost Sensor Calibration", "snippet": "From a Springer journal..."},
-        {"url": "http://arxiv.org/abs/2401.0004", "title": "Comprehensive Review of ML in Air Quality Monitoring", "snippet": "Appears in an Elsevier journal..."},
-        {"url": "http://arxiv.org/abs/2401.0005", "title": "Federated Learning for Privacy-Preserving Air Quality Analysis", "snippet": "An IEEE conference paper..."},
-        {"url": "http://arxiv.org/abs/2401.0006", "title": "Unsupervised Anomaly Detection in Air Quality Time-Series Data", "snippet": "Proceedings of ACM..."},
+        {"url": "https://www.semanticscholar.org/paper/mock-paper-1", "title": "Advanced LSTM Networks for Indoor Air Quality Prediction - IEEE Transactions", "snippet": "Published in IEEE Transactions on ...", "pdf_url": "http://example.com/paper1.pdf"},
+        {"url": "https://www.semanticscholar.org/paper/mock-paper-2", "title": "A Transformer-based Model for Real-time Pollutant Forecasting", "snippet": "A publication by ACM...", "pdf_url": "http://example.com/paper2.pdf"},
+        {"url": "https://www.semanticscholar.org/paper/mock-paper-3", "title": "Machine Learning Approaches for Low-Cost Sensor Calibration", "snippet": "From a Springer journal...", "pdf_url": "http://example.com/paper3.pdf"},
+        {"url": "https://www.semanticscholar.org/paper/mock-paper-4", "title": "Comprehensive Review of ML in Air Quality Monitoring", "snippet": "Appears in an Elsevier journal...", "pdf_url": "http://example.com/paper4.pdf"},
+        {"url": "https://www.semanticscholar.org/paper/mock-paper-5", "title": "Federated Learning for Privacy-Preserving Air Quality Analysis", "snippet": "An IEEE conference paper...", "pdf_url": "http://example.com/paper5.pdf"},
+        {"url": "https://www.semanticscholar.org/paper/mock-paper-6", "title": "Unsupervised Anomaly Detection in Air Quality Time-Series Data", "snippet": "Proceedings of ACM...", "pdf_url": "http://example.com/paper6.pdf"},
     ]
     return mock_papers
 
@@ -138,12 +135,7 @@ class RAPTOR:
             os.remove(self.checkpoint_path)
 
     def _cluster_nodes(self, docs: List[Document]) -> List[List[int]]:
-        """
-        Clusters a list of documents using KMeans.
-        The number of clusters is determined dynamically to ensure the recursive process terminates.
-        """
         num_docs = len(docs)
-
 
         if num_docs <= 5:
             st.write(f"Grouping {num_docs} remaining nodes into a single summary to finalize the tree.")
@@ -151,10 +143,8 @@ class RAPTOR:
 
         st.write(f"Embedding {num_docs} nodes for clustering...")
         embeddings = self.embeddings_model.embed_documents([doc.page_content for doc in docs])
-
         n_clusters = max(2, num_docs // 5)
         
-
         if n_clusters >= num_docs:
             n_clusters = num_docs - 1
 
@@ -193,7 +183,7 @@ class ResearchState(TypedDict):
     max_results: int
     final_kept_papers: Dict[str, List[str]]
     path_to_metadata_map: Dict[str, Dict[str, str]]
-    all_arxiv_results: List[Dict[str, Any]]
+    all_search_results: List[Dict[str, Any]]
     papers_to_download: List[Dict[str, Any]]
     extracted_docs: List[Document]
     relevant_docs: List[Document]
@@ -207,92 +197,106 @@ def start_search_node(state: ResearchState) -> ResearchState:
     return {"discard_log": [], "final_kept_papers": {}}
 
 
-def arxiv_search_node(state: ResearchState) -> ResearchState:
+def semantic_scholar_search_node(state: ResearchState) -> ResearchState:
     if st.session_state.get("debug_mode", False):
         st.warning("DEBUG MODE: Using mock data for search.")
-        return {"all_arxiv_results": create_mock_data()}
+        return {"all_search_results": create_mock_data()}
 
     query = state["query"]
     max_results = state["max_results"]
     
-    # --- Resilience Parameters ---
-    max_retries = 3
-    initial_delay = 2 # seconds
-    # ---------------------------
+    max_retries = 5
+    initial_delay = 10
+    
+    found_papers = []
+    offset = 0
+    limit = 100
 
-    for attempt in range(max_retries):
-        try:
-            # Add attempt number to the status message
-            st.write(f"Stage 1: Searching the official arXiv API (Attempt {attempt + 1}/{max_retries})...")
-            
-            found_papers = [] # Reset results for each attempt
+    st.write(f"Stage 1: Searching the Semantic Scholar API...")
+    search_progress = st.progress(0, text=f"Fetching up to {max_results} papers from Semantic Scholar...")
 
-            # Construct the search object.
-            search = arxiv.Search(
-                query=query,
-                max_results=max_results,
-                sort_by=arxiv.SortCriterion.Relevance
-            )
-
-            results_generator = search.results()
-            search_progress = st.progress(0, text=f"Fetching up to {max_results} papers from arXiv...")
-
-            for i, result in enumerate(results_generator):
-                if i >= max_results:
-                    break
+    while len(found_papers) < max_results:
+        results_on_last_call = []
+        for attempt in range(max_retries):
+            try:
+                api_url = (
+                    f"https://api.semanticscholar.org/graph/v1/paper/search"
+                    f"?query={requests.utils.quote(query)}"
+                    f"&offset={offset}"
+                    f"&limit={limit}"
+                    f"&fields=title,abstract,url,openAccessPdf"
+                )
                 
-                found_papers.append({
-                    "url": result.entry_id,
-                    "title": result.title,
-                    "snippet": result.summary
-                })
+                response = requests.get(api_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
 
-                search_progress.progress((i + 1) / max_results, text=f"Processing paper {i + 1}/{max_results}...")
-                time.sleep(0.1) # Be polite to the API
-            
-            # --- Success Case ---
-            # If the loop completes without raising an exception, we're done.
-            st.success(f"arXiv API search finished successfully. Found {len(found_papers)} candidate papers.")
-            return {"all_arxiv_results": found_papers}
-
-        except Exception as e:
-            # --- Failure Case ---
-            # Check if it's the specific error we want to retry
-            if "Page of results was unexpectedly empty" in str(e):
-                if attempt < max_retries - 1:
-                    # It's a retriable error, and we have attempts left.
-                    delay = initial_delay * (2 ** attempt) # Exponential backoff
-                    st.warning(f"arXiv API returned an empty page. Retrying in {delay} seconds...")
+                if response.status_code == 429:
+                    delay = initial_delay * (2 ** attempt)
+                    st.warning(f"Rate limit hit. Retrying in {delay} seconds...")
                     time.sleep(delay)
-                    # The loop will continue to the next attempt.
-                else:
-                    # It was the last attempt, so now we fail.
-                    st.error(f"arXiv API search failed after {max_retries} attempts. The API might be unstable. Please try again later.")
-                    return {"all_arxiv_results": []}
-            else:
-                # It's a different, unrecoverable error.
-                st.error(f"An unrecoverable error occurred during the arXiv API search: {e}")
-                return {"all_arxiv_results": []}
+                    continue
+                
+                response.raise_for_status()
+                
+                data = response.json()
+                results_on_last_call = data.get("data", [])
 
-    # This fallback is executed only if the loop finishes without a successful return (should not happen with this logic, but it's safe).
-    return {"all_arxiv_results": []}
+                if not results_on_last_call:
+                    break
+
+                for paper in results_on_last_call:
+                    found_papers.append({
+                        "url": paper.get('url'),
+                        "title": paper.get('title'),
+                        "snippet": paper.get('abstract', '') or '',
+                        "pdf_url": (paper.get('openAccessPdf') or {}).get('url')
+                    })
+                
+                progress_value = min(len(found_papers) / max_results, 1.0)
+                search_progress.progress(progress_value, text=f"Processing paper {len(found_papers)}/{max_results}...")
+                
+                offset += limit
+                time.sleep(0.5)
+                break
+
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)
+                    st.warning(f"API request failed: {e}. Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    st.error(f"Semantic Scholar API search failed after {max_retries} attempts: {e}")
+                    return {"all_search_results": found_papers}
+        
+        if not results_on_last_call:
+            break
+
+    final_results = found_papers[:max_results]
+    st.success(f"Semantic Scholar API search finished. Found {len(final_results)} candidate papers.")
+    return {"all_search_results": final_results}
+
 
 def filter_by_publisher_node(state: ResearchState) -> ResearchState:
-    st.write("Stage 2: Filtering by Publisher based on search text...")
+    st.write("Stage 2: Filtering by Publisher...")
     
     papers_to_download = []
     discard_log = state.get("discard_log", [])
     selected_publishers = state["publishers"]
+    all_papers = state["all_search_results"]
     
-    for paper in state["all_arxiv_results"]:
-        # The abstract (snippet) is now much more reliable for finding publisher info
+    if not selected_publishers:
+        st.info("No publishers selected. Skipping publisher filter and proceeding with all found papers.")
+        for paper in all_papers:
+            paper_meta = paper.copy()
+            paper_meta["publisher"] = "Not Filtered"
+            papers_to_download.append(paper_meta)
+        return {"papers_to_download": papers_to_download, "discard_log": discard_log}
+
+    for paper in all_papers:
         search_text = (paper["title"] + " " + paper["snippet"]).lower()
-        
         found_publishers = [pub for pub in selected_publishers if pub.lower() in search_text]
         
         if found_publishers:
             matched_publisher = found_publishers[0]
-            
             paper_meta = paper.copy()
             paper_meta["publisher"] = matched_publisher
             papers_to_download.append(paper_meta)
@@ -304,7 +308,7 @@ def filter_by_publisher_node(state: ResearchState) -> ResearchState:
                 "publisher": "Unknown"
             })
             
-    discarded_count = len(state["all_arxiv_results"]) - len(papers_to_download)
+    discarded_count = len(all_papers) - len(papers_to_download)
     st.info(f"Discarded {discarded_count} papers due to publisher mismatch.")
     st.success(f"{len(papers_to_download)} papers passed the publisher filter.")
     
@@ -319,6 +323,8 @@ def download_pdfs_node(state: ResearchState) -> ResearchState:
             os.makedirs("temp_pdfs")
 
         for paper in state["papers_to_download"]:
+            if not paper.get("pdf_url"):
+                 continue
             filename = f"temp_pdfs/{uuid.uuid4()}.pdf"
             pdf = FPDF()
             pdf.add_page()
@@ -342,40 +348,51 @@ def download_pdfs_node(state: ResearchState) -> ResearchState:
         os.makedirs("temp_pdfs")
     
     papers_to_download = state["papers_to_download"]
-    total_urls = len(papers_to_download)
+    total_papers = len(papers_to_download)
     
-    if total_urls == 0:
+    if total_papers == 0:
         st.warning("No papers to download after filtering.")
         return {"path_to_metadata_map": {}, "discard_log": discard_log}
         
     download_progress = st.progress(0, text="Starting download...")
     
+    max_retries = 3
+    initial_delay = 5
+
     for i, paper in enumerate(papers_to_download):
         url = paper["url"]
-        download_progress.progress((i + 1) / total_urls, text=f"Downloading paper {i+1}/{total_urls}...")
-        try:
-            # The URL from the arxiv package is the abstract page, e.g., 'http://arxiv.org/abs/2401.12345v1'
-            # We need to convert it to the PDF URL
-            pdf_url = url.replace('/abs/', '/pdf/') + '.pdf'
+        pdf_url = paper.get("pdf_url")
+        download_progress.progress((i + 1) / total_papers, text=f"Downloading paper {i+1}/{total_papers}...")
 
-            response = requests.get(pdf_url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'}, stream=True)
-            response.raise_for_status()
-            
-            filename = f"temp_pdfs/{uuid.uuid4()}.pdf"
-            with open(filename, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            path_to_metadata_map[filename] = {
-                "url": url, 
-                "publisher": paper["publisher"], 
-                "title": paper["title"]
-            }
-        except requests.exceptions.RequestException as e:
-            discard_log.append({
-                "url": url, "title": paper["title"], "reason": f"Download failed: {e}", "publisher": paper["publisher"]
-            })
-            
-    discarded_count = total_urls - len(path_to_metadata_map)
+        if not pdf_url:
+            discard_log.append({"url": url, "title": paper["title"], "reason": "Download failed: No Open Access PDF URL found", "publisher": paper["publisher"]})
+            continue
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(pdf_url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'}, stream=True)
+                response.raise_for_status()
+                
+                if 'application/pdf' not in response.headers.get('Content-Type', '').lower():
+                    discard_log.append({"url": url, "title": paper["title"], "reason": "Download failed: URL was not a PDF", "publisher": paper["publisher"]})
+                    break
+
+                filename = f"temp_pdfs/{uuid.uuid4()}.pdf"
+                with open(filename, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                path_to_metadata_map[filename] = {"url": url, "publisher": paper["publisher"], "title": paper["title"]}
+                break
+
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)
+                    time.sleep(delay)
+                else:
+                    discard_log.append({"url": url, "title": paper["title"], "reason": f"Download failed after retries: {e}", "publisher": paper["publisher"]})
+
+    discarded_count = total_papers - len(path_to_metadata_map)
     st.info(f"Discarded {discarded_count} papers due to download or format issues.")
     st.success(f"Successfully downloaded {len(path_to_metadata_map)} papers.")
             
@@ -528,10 +545,10 @@ def build_raptor_index_node(state: ResearchState) -> ResearchState:
     st.success("Research and indexing complete! You can now ask questions.")
     return {"raptor_index": raptor_index, "final_kept_papers": dict(final_kept_papers)}
 
-# --- UPDATED GRAPH DEFINITION ---
+# --- GRAPH DEFINITION ---
 builder = StateGraph(ResearchState)
 builder.add_node("start_search", start_search_node)
-builder.add_node("arxiv_search", arxiv_search_node) # <-- NEW
+builder.add_node("semantic_scholar_search", semantic_scholar_search_node)
 builder.add_node("filter_by_publisher", filter_by_publisher_node)
 builder.add_node("download_pdfs", download_pdfs_node)
 builder.add_node("extract_text", extract_text_node)
@@ -539,8 +556,8 @@ builder.add_node("filter_by_relevance", filter_by_relevance_node)
 builder.add_node("build_raptor_index", build_raptor_index_node)
 
 builder.add_edge(START, "start_search")
-builder.add_edge("start_search", "arxiv_search") # <-- NEW
-builder.add_edge("arxiv_search", "filter_by_publisher") # <-- Connect the new node
+builder.add_edge("start_search", "semantic_scholar_search")
+builder.add_edge("semantic_scholar_search", "filter_by_publisher")
 builder.add_edge("filter_by_publisher", "download_pdfs")
 builder.add_edge("download_pdfs", "extract_text")
 builder.add_edge("extract_text", "filter_by_relevance")
@@ -548,7 +565,7 @@ builder.add_edge("filter_by_relevance", "build_raptor_index")
 builder.add_edge("build_raptor_index", END)
 graph = builder.compile()
 
-# --- HELPER FUNCTIONS & UI (No changes) ---
+# --- HELPER FUNCTIONS & UI ---
 def render_mermaid_to_image(mermaid_code: str) -> Optional[bytes]:
     try:
         graphbytes = mermaid_code.encode("utf8")
@@ -563,8 +580,42 @@ def render_mermaid_to_image(mermaid_code: str) -> Optional[bytes]:
         st.error(f"Failed to render Mermaid diagram: {e}")
         return None
 
+def format_chat_as_report(chat_history: List[Dict[str, str]], llm: Any) -> str:
+    """Uses an LLM to format a chat history into a formal academic-style Q&A report."""
+    if not chat_history:
+        return "No conversation to report."
+        
+    chat_log_string = ""
+    for message in chat_history:
+        role = "Question" if message.get('role') == 'user' else "Answer"
+        chat_log_string += f"{role}: {message.get('content')}\n\n---\n\n"
+
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert academic writer. Your task is to transform a raw question-and-answer chat log into a formal academic report.
+Follow these instructions precisely:
+1.  For each 'Question' from the user, rephrase it into a formal, academic-style section heading or a research question. For example, 'what is lstm?' could become 'An Inquiry into Long Short-Term Memory Networks'.
+2.  For each 'Answer' from the assistant, rewrite it in a formal, objective, and academic tone, suitable for a research paper. Remove any conversational filler.
+3.  Structure the final output as a series of these formal questions and answers. Each question should serve as a subtitle for the answer that follows.
+4.  Do not invent any information. Your response must be based *only* on the provided chat log content.
+5.  The final output should read like a structured academic document, not a casual conversation."""),
+        ("human", "Please convert the following chat log into a formal, academic-style Q&A report:\n\n---\n\n{chat_log}")
+    ])
+
+    chain = prompt_template | llm
+    
+    try:
+        response = chain.invoke({"chat_log": chat_log_string})
+        report_content = response.content
+        
+        # Post-processing to remove <think> tags and their content
+        cleaned_content = re.sub(r"<think>.*?</think>", "", report_content, flags=re.DOTALL).strip()
+        return cleaned_content
+    except Exception as e:
+        st.error(f"Failed to format report: {e}")
+        return "Error: Could not format the chat log into a report."
+
 def generate_pdf_report(
-    chat_history: List[Dict[str, str]], 
+    report_content: str, 
     used_sources: List[str],
     mermaid_image_bytes: Optional[bytes] = None
 ) -> bytes:
@@ -573,20 +624,13 @@ def generate_pdf_report(
     pdf.add_font('DejaVu', 'B', 'fonts/DejaVuSans-Bold.ttf', uni=True)
     pdf.add_page()
     pdf.set_font("DejaVu", 'B', size=16)
-    pdf.cell(0, 10, txt="Q&A Chat History", ln=True, align='C')
+    pdf.cell(0, 10, txt="Research Findings Report", ln=True, align='C')
     pdf.ln(10)
 
-    for message in chat_history:
-        role, content = message.get('role', ''), message.get('content', '')
-        if role == 'user':
-            pdf.set_font('DejaVu', 'B', 12)
-            pdf.set_text_color(0, 0, 128)
-            pdf.multi_cell(0, 10, f"Question: {content}")
-        else:
-            pdf.set_font('DejaVu', '', 12)
-            pdf.set_text_color(0, 0, 0)
-            pdf.multi_cell(0, 10, f"Answer: {content}")
-        pdf.ln(5)
+    pdf.set_font('DejaVu', '', 12)
+    pdf.set_text_color(0, 0, 0)
+    pdf.multi_cell(0, 8, report_content) # Reduced line height for better paragraph spacing
+    pdf.ln(5)
 
     if mermaid_image_bytes:
         pdf.add_page()
@@ -612,12 +656,9 @@ def generate_pdf_report(
         pdf.ln(5)
         pdf.set_font("DejaVu", size=10)
         for i, source in enumerate(sorted(list(used_sources))):
-           
             pdf.write(h=8, text=f"{i+1}. {source}")
-       
             pdf.ln(8) 
             
-
     return bytes(pdf.output(dest='S'))
 
 def generate_bibliography_pdf(papers_by_publisher: Dict[str, List[str]]) -> bytes:
@@ -636,21 +677,19 @@ def generate_bibliography_pdf(papers_by_publisher: Dict[str, List[str]]) -> byte
             pdf.ln(5)
             pdf.set_font("DejaVu", size=10)
             for i, url in enumerate(urls):
-           
                 pdf.write(h=8, text=f"{i+1}. {url}")
                 pdf.ln(8)
-  
             pdf.ln(5)
             
     return bytes(pdf.output(dest='S'))
 
 def generate_mermaid_diagram(final_state: ResearchState) -> str:
-    total_found = len(final_state.get('all_arxiv_results', []))
+    total_found = len(final_state.get('all_search_results', []))
     discard_log = final_state.get('discard_log', [])
     
     discard_counts = Counter(item['reason'] for item in discard_log)
     publisher_discards = discard_counts.get("Publisher not in selected list", 0)
-    download_discards = sum(count for reason, count in discard_counts.items() if "Download failed" in reason or "not a PDF" in reason)
+    download_discards = sum(count for reason, count in discard_counts.items() if "Download failed" in reason)
     corrupt_discards = discard_counts.get("Corrupted or unreadable PDF", 0)
     relevance_discards = discard_counts.get("Not relevant to query", 0) + discard_counts.get("LLM relevance check failed", 0)
 
@@ -661,10 +700,10 @@ def generate_mermaid_diagram(final_state: ResearchState) -> str:
     after_relevance = after_extract - relevance_discards
     
     query = final_state.get('query', 'N/A').replace('"', "'")
-    publishers = ", ".join(final_state.get('publishers', []))
+    publishers = ", ".join(final_state.get('publishers', [])) if final_state.get('publishers') else "None"
 
     diagram = f"""graph TD;
-    A[Start: User Input] --> B(Search arXiv API);
+    A[Start: User Input] --> B(Search Semantic Scholar API);
     B --> C{{Found {after_search} candidate papers}};
     C --> D[Filter by Publisher];
     D -- Pass: {after_publisher} --> E[Download & Validate PDFs];
@@ -701,7 +740,7 @@ def get_ollama_models():
 def main():
     st.set_page_config(layout="wide", page_title="Academic Deep Search")
     st.title("📚 Academic Deep Search & QA with RAPTOR")
-    st.markdown("Powered by Ollama 🦙 and the official arXiv API 🧑‍💻")
+    st.markdown("Powered by Ollama 🦙 and the Semantic Scholar API 🧑‍💻")
 
     if "session_id" not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
@@ -719,23 +758,23 @@ def main():
         if debug_mode:
             st.warning("Debug mode is ON. Live data will not be fetched.")
 
-        query = st.text_input("Academic Topic (searches arXiv)", "indoor air quality monitoring using machine learning")
+        query = st.text_input("Academic Topic (searches Semantic Scholar)", "indoor air quality monitoring using machine learning")
         
         publishers = st.multiselect(
             "Filter by Publisher (searches abstract text)",
             options=DEFAULT_PUBLISHERS,
-            default=DEFAULT_PUBLISHERS
+            default=[]
         )
-        st.info("The pipeline will first get papers from arXiv, then check if their abstracts contain these publisher names.")
+        st.info("The pipeline searches Semantic Scholar, then checks abstracts for these names. If none are selected, all papers will proceed.")
 
-        max_results = st.slider("Max Papers to Find", min_value=10, max_value=3000, value=100, step=10)
+        max_results = st.slider("Max Papers to Find", min_value=10, max_value=5000, value=100, step=10)
       
         st.header("2. AI Model Configuration")
         
         ollama_models = get_ollama_models()
         if ollama_models:
             default_chat_index = ollama_models.index("llama3:8b") if "llama3:8b" in ollama_models else 0
-            model_name = st.selectbox("Select a Chat/Relevance Model", ollama_models, index=default_chat_index)
+            model_name = st.selectbox("Select a Chat/Relevance/Report Model", ollama_models, index=default_chat_index)
             
             default_summary_index = ollama_models.index("llama3:8b") if "llama3:8b" in ollama_models else 0
             summary_model_name = st.selectbox("Select a Summary Model", ollama_models, index=default_summary_index)
@@ -744,7 +783,7 @@ def main():
             embeddings_model_name = st.selectbox("Select an Embeddings Model", ollama_models, index=default_embed_index)
         else:
             st.warning("Ollama not detected. Please enter model names manually.")
-            model_name = st.text_input("Ollama Chat/Relevance Model", "llama3")
+            model_name = st.text_input("Ollama Chat/Relevance/Report Model", "llama3")
             summary_model_name = st.text_input("Ollama Summary Model Name", "llama3")
             embeddings_model_name = st.text_input("Ollama Embeddings Model Name", "mxbai-embed-large")
         
@@ -784,7 +823,6 @@ def main():
                             st.rerun()
                         else:
                             st.error("Research pipeline failed to build an index. Check logs for errors.")
-
 
     if st.session_state.research_done:
         st.header("Conversational QA")
@@ -841,9 +879,17 @@ def main():
                         with st.spinner("Generating pipeline diagram..."):
                             mermaid_bytes = render_mermaid_to_image(mermaid_code)
                     
+                    with st.spinner("Formatting chat into an academic report..."):
+                        model_config = st.session_state.model_config
+                        llm, _ = get_llm_and_embeddings(model_name=model_config["model_name"])
+                        report_content = format_chat_as_report(
+                            chat_history=st.session_state.messages,
+                            llm=llm
+                        )
+
                     with st.spinner("Generating PDF report..."):
                         pdf_bytes = generate_pdf_report(
-                            chat_history=st.session_state.messages, 
+                            report_content=report_content, 
                             used_sources=list(st.session_state.used_sources),
                             mermaid_image_bytes=mermaid_bytes
                         )
@@ -871,7 +917,6 @@ def main():
             st.code(mermaid_code, language="mermaid")
             st.write("Discard Log:")
             st.json(st.session_state.final_state.get('discard_log', []))
-
 
     else:
         st.info("Configure your research and AI model in the sidebar, then click 'Start Research Pipeline'.")
